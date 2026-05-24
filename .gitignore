@@ -1,0 +1,30 @@
+# Go build artifacts
+/dist/
+/coverage.out
+/*.exe
+
+# Test artifacts
+slowtest.log
+debug.log
+testlog.txt
+*.test
+*.out
+
+# Editor / IDE
+/.idea/
+/.vscode/
+*.swp
+*~
+
+# Android plugin build artifacts
+android-plugin/.gradle/
+android-plugin/app/build/
+android-plugin/build/
+android-plugin/app/src/main/jniLibs/
+android-plugin/local.properties
+
+
+# Local config (may contain credentials)
+client*.yaml
+server*.yaml
+config.yaml

@@ -1,0 +1,302 @@
+# true-imap-tunnel example configuration
+#
+# This file shows both sides of a tunnel that exposes a remote SSH server
+# (running on the "server" host) on a local TCP port on the "client" host,
+# using a shared IMAP account as the only transport.
+#
+# To run the same tunnel symmetrically, you'd typically keep two YAML files
+# — one for each side — with mirrored folder_send / folder_recv values.
+
+# ---------------------------------------------------------------------------
+# CLIENT SIDE (run with: true-imap-tunnel -config client.yaml)
+# ---------------------------------------------------------------------------
+#
+# mode: client
+# listen: "127.0.0.1:2222"      # local port to expose to other tools
+#
+# accounts:
+#   - name: "primary"
+#     host: "imap.example.com:993"
+#     username: "tunnel@example.com"
+#     password: "app-password-1"
+#     tls: "implicit"            # implicit | starttls | none
+#     folder_send: "TunnelC2S"   # client appends here; server reads here
+#     folder_recv: "TunnelS2C"   # client reads here; server appends here
+#
+#   # Optional second account (multipath). Streams are distributed
+#   # according to multipath_mode; inbound is watched in parallel.
+#   - name: "secondary"
+#     host: "imap.other.com:993"
+#     username: "tunnel2@other.com"
+#     password: "app-password-2"
+#     tls: "implicit"
+#     folder_send: "TunnelC2S"
+#     folder_recv: "TunnelS2C"
+
+# ---------------------------------------------------------------------------
+# SERVER SIDE (run with: true-imap-tunnel -config server.yaml)
+# ---------------------------------------------------------------------------
+#
+# mode: server
+# target: "127.0.0.1:22"        # local SSH daemon on the server host
+#
+# accounts:
+#   - name: "primary"
+#     host: "imap.example.com:993"
+#     username: "tunnel@example.com"
+#     password: "app-password-1"
+#     tls: "implicit"
+#     # Folders SWAPPED relative to the client.
+#     folder_send: "TunnelS2C"
+#     folder_recv: "TunnelC2S"
+#
+#   - name: "secondary"
+#     host: "imap.other.com:993"
+#     username: "tunnel2@other.com"
+#     password: "app-password-2"
+#     tls: "implicit"
+#     folder_send: "TunnelS2C"
+#     folder_recv: "TunnelC2S"
+
+# ---------------------------------------------------------------------------
+# COMMON OPTIONS (apply to either mode)
+# ---------------------------------------------------------------------------
+
+# Mode (client | server). Required.
+mode: client
+
+# Log verbosity. One of error | warn | info | debug | trace.
+# Default: info. Overridden by the -log-level CLI flag, or stacked -v
+# flags (-v = debug, -v -v = trace).
+log_level: info
+
+# Local listen address (client mode only).
+listen: "127.0.0.1:2222"
+
+# Target dial address (server mode only).
+target: "127.0.0.1:22"
+
+# client_id (uint8, 1..255). REQUIRED on each client when multiple
+# clients share the same server / folder pair; leave 0 (the default)
+# for a one-client-one-server deployment.
+#
+# The top byte of every stream ID is stamped with this value, so the
+# server preserves it in its responses and each client only fetches /
+# deletes the messages tagged with its own ID. Messages destined for
+# other clients are left in the folder for them to pick up.
+#
+# IGNORED in server mode.
+# client_id: 1
+
+# IMAP accounts: at least one is required. Listing several enables
+# multipath: outbound streams/frames are distributed according to
+# multipath_mode, and every account's watcher feeds the same inbound stream.
+accounts:
+  - name: "primary"
+    host: "imap.example.com:993"
+    username: "tunnel@example.com"
+
+    # ----- pick ONE authentication method ------------------------------
+    # (a) Plain LOGIN — fine for most providers (Fastmail, seznam.cz,
+    #     most self-hosted servers).
+    password: "app-password-1"
+
+    # (b) OAuth2 / XOAUTH2 — REQUIRED for Outlook.com, Office 365 and
+    #     Gmail (those servers reject the legacy LOGIN command).
+    #     Either supply a static access token (short-lived — only useful
+    #     for ad-hoc testing):
+    # oauth2_token: "ya29.A0AfH6SM…"
+    #     …or a command that prints a fresh token on stdout, invoked on
+    #     every (re)connect so an external refresher handles expiry
+    #     without coordinating with this process. Some good options:
+    #       https://github.com/pdobsan/oama   (oama access <email>)
+    #       https://tratt.net/laurie/src/pizauth/  (pizauth show <account>)
+    #       https://github.com/google/oauth2l       (Google services)
+    # oauth2_token_command: "oama access user@outlook.com"
+    # -------------------------------------------------------------------
+
+    tls: "implicit"                # "implicit" (993) | "starttls" (143) | "none"
+    insecure_skip_verify: false    # set true only for self-signed test servers
+    folder_send: "TunnelC2S"
+    folder_recv: "TunnelS2C"
+
+# Reorder incoming frames by SeqID per stream. Required when more than one
+# account is in use (independent paths have independent latency). Safe to
+# leave on even with a single account.
+reorder: true
+
+# How long the client waits for OPEN_OK after sending OPEN.
+open_timeout_sec: 30
+
+# How long the server tries to dial the target before giving up.
+dial_timeout_sec: 10
+
+# IMAP reconnect backoff (applies to both senders and watchers).
+reconnect_initial_delay_ms: 500
+reconnect_max_delay_ms: 30000
+reconnect_backoff: 1.5
+
+# Polling fallback for IMAP servers that don't advertise IDLE (RFC 2177)
+# — notably seznam.cz. With FETCH directly issued on each cycle, there's
+# no separate NOOP; the cycle simply runs FETCH lastUID+1:* and reacts
+# to whatever is there. Ignored when the server does support IDLE.
+#
+# The watcher uses two intervals:
+#   - poll_interval_ms (idle):    used when nothing is going on
+#   - active_poll_interval_ms:    used right after this side sent
+#                                 something, or right after the previous
+#                                 poll returned new frames
+# Active mode lasts for active_poll_duration_ms after the last activity.
+poll_interval_ms: 3000
+active_poll_interval_ms: 100
+active_poll_duration_ms: 5000
+
+# Lazy EXPUNGE: don't flush deleted messages on every cycle (each EXPUNGE
+# is one IMAP round-trip; on slow paths that dominates interactive
+# latency). Instead, accumulate deleted UIDs and EXPUNGE in batches.
+#
+#   lazy_expunge_threshold:    flush when this many UIDs accumulate
+#   lazy_expunge_max_age_ms:   flush after this much time anyway
+#
+# Set lazy_expunge_threshold: 1 to restore eager per-cycle EXPUNGE.
+lazy_expunge_threshold: 16
+lazy_expunge_max_age_ms: 30000
+
+# End-to-end RTT probe (client mode only).
+#
+#   < 0  : disabled, no probe is ever emitted.
+#    0   : single probe right after the IMAP transport is up (default).
+#          Useful as a connectivity sanity-check at startup with no
+#          ongoing overhead.
+#   > 0  : single probe at startup, then repeat on this period (ms).
+#          Common diagnostic setting: 5000–30000.
+#
+# Each probe sends a Ping carrying the send timestamp and optional
+# client_version/build metadata; the peer echoes it back as Pong, and
+# the client logs:
+#   [INFO] rtt=237ms via "primary"
+# The server logs client_version when present, which helps detect
+# outdated Android plugin builds. Normally the CLI fills this from
+# build metadata; set it only if you need a custom label.
+# client_version: "manual-build"
+# Ignored in server mode.
+ping_interval_ms: 0
+
+# Frame-level encryption. When set, every frame is encrypted with
+# AES-256-GCM before being base64-encoded into the IMAP message body.
+# Both sides MUST use the same passphrase or every received frame
+# fails to decrypt and is dropped (with a warning in the log).
+#
+# Purpose: content concealment from the email provider, not security
+# against an active attacker (TLS to the IMAP server handles that).
+# The passphrase is hashed with SHA-256 to derive a 32-byte key.
+#
+# Each frame gets a fresh random 96-bit nonce + 128-bit auth tag —
+# 28 bytes of overhead per frame, negligible for normal payloads.
+#
+# Empty = disabled (default).
+# encryption_passphrase: "correct horse battery staple"
+
+# Optional DNS override for resolving IMAP hosts (and the server-mode
+# target when it is a hostname). If unset, the local/system resolver is
+# used first. If that local resolver fails at startup and no DNS servers
+# are explicitly configured, the tunnel falls back to 1.1.1.1:53.
+#
+# Bare IPs get port 53 automatically.
+# dns_servers:
+#   - "1.1.1.1"
+
+# Graceful-shutdown deadline. On Ctrl+C / SIGTERM the tunnel emits a
+# RST frame for every still-open stream so the peer can release its
+# bookkeeping cleanly. This caps how long that courtesy notification
+# may take — once exceeded, we proceed to forced teardown (the peer
+# will time out the orphans on its own).
+#
+# Set to 0 to skip the RST burst entirely.
+graceful_shutdown_ms: 3000
+
+# Cross-stream send batching.
+#
+# When many TCP streams write concurrently they share a single IMAP
+# sender per account, which APPENDs one message at a time. While an
+# APPEND is in flight, frames from other streams pile up on a queue;
+# when the APPEND completes the sender opportunistically packs the
+# queue into ONE batch message and APPENDs the lot. This trades a tiny
+# bit of latency (the sub-millisecond it takes to drain the queue) for
+# a substantial throughput win under contention — e.g. 8 concurrent
+# HTTPS downloads share APPENDs instead of each getting their own.
+#
+# batch_delay_ms:   after the first frame arrives in an idle sender,
+#                   wait this long before draining the queue. Gives
+#                   frames from other streams a chance to arrive and
+#                   share the same APPEND. Only applies when the sender
+#                   is idle; during sustained traffic frames pile up
+#                   naturally. Default 2. Set explicitly to 0 for
+#                   minimum per-connection latency.
+#                   TIP: this knob is worth A/B-testing on your own
+#                   setup. Try 0 first, then 5 / 10 / 20. Throughput AND
+#                   stability (reconnects, stalled streams, server-side
+#                   throttling) can vary dramatically depending on the
+#                   tunneled protocol (interactive SSH vs bulk HTTPS vs
+#                   Shadowsocks) and the IMAP server's APPEND/FETCH
+#                   behavior. Pick the value that stays stable.
+# batch_max_frames: cap on the number of frames packed into one APPEND.
+#   Default 64. Set to 1 to disable batching (one APPEND per frame).
+# batch_max_kb:     parallel cap on the encoded batch size, in KiB.
+#                   Default 256. The smaller of the two caps wins.
+# batch_queue_size: per-sender outbound queue depth before back-pressure
+#                   kicks in. Default 256.
+# async_data_send:  when true, DATA frames return after entering the
+#                   bounded sender queue instead of waiting for the IMAP
+#                   APPEND to complete. Can improve throughput, but DATA
+#                   append errors become asynchronous. Default false;
+#                   recommended true for interactive SOCKS/TLS tunnels.
+batch_delay_ms: 2
+batch_max_frames: 64
+batch_max_kb: 256
+batch_queue_size: 256
+async_data_send: true
+
+# Per-stream inbound queue depth (receive side). Each multiplexed
+# stream has its own TCP-write queue + dedicated writer goroutine on
+# the receive side; the IMAP watcher's dispatch loop enqueues frames
+# here without ever blocking on a slow TCP consumer. If a stream's
+# TCP peer stops reading and its queue overflows, that single stream
+# is locally RST'd (the peer is notified) — every other stream
+# sharing the mailbox keeps flowing unaffected.
+#
+# Default 64 frames ≈ a few MB of buffered data per stream with
+# typical frames; comfortably larger than any transient TCP
+# backpressure on a healthy network.
+inbound_queue_size: 64
+
+# How the IMAP message body carrying each frame is structured. Both modes
+# encode the frame in base64; the difference is purely in how the message
+# *looks* in a mail client browsing the folder.
+#
+#   "attachment" (default): the body is a binary attachment
+#     (Content-Type: application/octet-stream). Mail clients show a
+#     paperclip and use attachment_filename as the displayed name —
+#     otherwise they tend to label it "Untitled.bin".
+#
+#   "text": the body is plain text whose content is the literal base64
+#     of the frame (Content-Type: text/plain). Mail clients render it
+#     as a normal message — useful if you don't want the tunnel
+#     folder to look like an attachment dump in mail clients.
+#
+# The two sides do NOT have to agree on format; the decoder tolerates
+# either. attachment mode tends to be more robust against servers that
+# splice unrelated text into the body (e.g. "external sender" warnings),
+# since such text becomes a separate MIME part rather than mixing with
+# the base64.
+message_format: attachment
+attachment_filename: "tunnel.bin"
+
+# Zero-RTT OPEN: client starts forwarding TCP data immediately after
+# sending the OPEN frame, without waiting for the server's OPEN_OK.
+# Saves one end-to-end round-trip per new stream — visible as a faster
+# first byte for client-first protocols.
+#
+# Experimental feature, use with caution.
+#
+# zero_rtt_open: true
