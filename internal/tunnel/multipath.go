@@ -70,21 +70,24 @@ var ErrNoSenders = errors.New("no IMAP sender currently connected")
 // Multi-client deployments pass a filter that compares the frame's
 // stream client-id to this side's client_id.
 //
-// aead, if non-nil, encrypts outbound frames (in senders) and decrypts
+// keys, if non-nil, encrypts outbound frames (in senders) and decrypts
 // inbound frames (in watchers). nil disables encryption.
-func NewMultipath(cfg *config.Config, handler imappkg.FrameHandler, filter imappkg.FrameFilter, aead *titcrypto.AEAD) *Multipath {
+func NewMultipath(cfg *config.Config, handler imappkg.FrameHandler, filter imappkg.FrameFilter, keys *titcrypto.KeyRing) *Multipath {
 	m := &Multipath{cfg: cfg}
 	for i := range cfg.Accounts {
 		acc := &cfg.Accounts[i]
-		s := imappkg.NewSender(cfg, acc, aead)
+		s := imappkg.NewSender(cfg, acc, keys)
 		s.AsyncErrorHandler = func(f protocol.Frame, err error) {
 			if m.OnAsyncSendError != nil {
 				m.OnAsyncSendError(f, err)
 			}
 		}
 		m.senders = append(m.senders, s)
-		w := imappkg.NewWatcher(cfg, acc, handler, aead)
+		w := imappkg.NewWatcher(cfg, acc, handler, keys)
 		w.Filter = filter
+		if cfg.Mode == config.ModeClient && cfg.ClientID != 0 && cfg.SubjectClientIDEnabled() {
+			w.SubjectClientID = cfg.ClientID
+		}
 		m.watchers = append(m.watchers, w)
 	}
 	return m

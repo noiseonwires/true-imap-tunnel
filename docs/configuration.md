@@ -59,7 +59,7 @@ accounts:
     folder_send: "TunnelC2S"
     folder_recv: "TunnelS2C"
 
-encryption_passphrase: "same secret on both sides"
+encryption_passphrase: "client-1-secret"
 async_data_send: true
 batch_delay_ms: 2
 ping_interval_ms: 0
@@ -86,7 +86,9 @@ accounts:
     folder_send: "TunnelS2C"
     folder_recv: "TunnelC2S"
 
-encryption_passphrase: "same secret on both sides"
+client_encryption_passphrases:
+  1: "client-1-secret"
+  2: "client-2-secret"
 async_data_send: true
 batch_delay_ms: 2
 ```
@@ -118,6 +120,12 @@ dns_servers:
 
 # Encrypt frames stored in IMAP. Empty/unset disables this extra layer.
 encryption_passphrase: "same secret on both sides"
+
+# Server-only optional per-client passphrases. Clients keep using their own
+# encryption_passphrase; the server chooses the mapped key by client_id.
+client_encryption_passphrases:
+  1: "client-1-secret"
+  2: "client-2-secret"
 
 # Receiver behavior.
 reorder: true
@@ -183,6 +191,14 @@ plain IMAP passwords are disabled there.
 - If you tunnel Shadowsocks through T.I.T.(S.), you can usually leave
   `encryption_passphrase` empty. Shadowsocks traffic is already encrypted, and
   double-encrypting every tunnel frame only adds CPU work and bytes of overhead.
+- On shared IMAP accounts with multiple tunnel clients, prefer server-side
+  `client_encryption_passphrases` over a single shared `encryption_passphrase`.
+  Each client keeps only its own passphrase in `encryption_passphrase`; the
+  server maps client IDs to passphrases and decrypts/encrypts with the matching
+  key. The legacy single passphrase remains as a fallback for unmapped clients.
+  This prevents other configured clients from reading or forging valid tunnel
+  frames for a different client, but shared IMAP credentials can still delete or
+  flood mailbox messages.
 - `zero_rtt_open: true` saves one tunnel round trip for new streams, but it is
   opt-in. Early DATA may need to be buffered or discarded if the server-side
   target dial is late or fails, so use it only after testing the actual protocol
@@ -202,9 +218,20 @@ plain IMAP passwords are disabled there.
 
 ## Customizing how messages look in the mailbox
 
-Two config knobs let you change how each tunnel draft appears to anyone (or
+Five config knobs let you change how each tunnel draft appears to anyone (or
 anything) browsing the IMAP folder in a normal mail client:
 
+- `message_subject` (default `TIT`) sets the fixed Subject header. The subject
+  used to be hardcoded as `TIT`; it is now configurable.
+- `message_subject_mode` (`fixed` — default — or `random`) controls Subject
+  generation. `fixed` uses `message_subject`; `random` generates a fresh random
+  hex subject for every draft.
+- `subject_client_id` (default `true`) prefixes drafts with a two-hex-digit
+  client ID token, allowing multi-client receivers to skip other clients'
+  messages after a lightweight header fetch instead of downloading and decoding
+  every body. Set it to `false` if exposing client IDs in Subject headers is a
+  concern; peers fall back to the encrypted body protocol when the tag is
+  absent.
 - `message_format` (`attachment` — default — or `text`) selects how the frame
   payload is carried inside the message body. `attachment` produces a binary
   MIME part (paperclip icon, "Open attachment" UI); `text` puts the same
@@ -215,12 +242,13 @@ anything) browsing the IMAP folder in a normal mail client:
   something innocuous (`notes.txt`, `image.dat`, etc.) if `tunnel.bin` is
   too on the nose for your threat model.
 
-The two endpoints do NOT have to agree on `message_format` — the decoder
-accepts either. `attachment` mode is slightly more robust against IMAP servers
-that splice unrelated text (e.g. "external sender" banners) into the body,
-because such text becomes a separate MIME part instead of mixing with the
-base64. See [`../config.example.yaml`](../config.example.yaml) for the full
-commentary.
+The two endpoints do NOT have to agree on these appearance settings — the
+decoder accepts either body format, and the Subject client-ID tag is an
+optimization with body-decode fallback. `attachment` mode is slightly more
+robust against IMAP servers that splice unrelated text (e.g. "external sender"
+banners) into the body, because such text becomes a separate MIME part instead
+of mixing with the base64. See [`../config.example.yaml`](../config.example.yaml)
+for the full commentary.
 
 ## Multipath
 

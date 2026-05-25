@@ -9,10 +9,13 @@ package imap
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/emersion/go-imap/v2/imapclient"
@@ -21,14 +24,15 @@ import (
 	"github.com/true-imap-tunnel/true-imap-tunnel/internal/netprotect"
 )
 
-// messageMarker is the Subject line of every tunnel message. The value is
-// deliberately innocuous and constant so IMAP servers don't apply any
-// filtering or special handling.
-const messageMarker = "TIT"
-
 // base64LineLen is the wrap length used when base64-encoding frame bodies.
 // 76 is the MIME standard.
 const base64LineLen = 76
+
+const randomSubjectBytes = 16
+
+const subjectClientIDHexLen = 2
+
+var readRandom = rand.Read
 
 // MessageOptions controls the wire format of the IMAP message body
 // carrying a frame.
@@ -42,12 +46,32 @@ type MessageOptions struct {
 	// Content-Type / Content-Disposition headers when Format is
 	// "attachment". Ignored for "text".
 	AttachmentFilename string
+
+	// Subject is used when SubjectMode is "fixed". Empty defaults to the
+	// historical "TIT" subject.
+	Subject string
+
+	// SubjectMode is "fixed" (default) or "random".
+	SubjectMode config.MessageSubjectMode
+
+	// ClientID is the stream client ID carried in the Subject when
+	// SubjectClientID is true.
+	ClientID byte
+
+	// SubjectClientID prefixes the Subject with a parseable client-ID token.
+	SubjectClientID bool
 }
 
 // defaultMessageOptions returns the historical attachment-with-"tunnel.bin"
 // behaviour. Used by tests that don't care which format is in use.
 func defaultMessageOptions() MessageOptions {
-	return MessageOptions{Format: "attachment", AttachmentFilename: "tunnel.bin"}
+	return MessageOptions{
+		Format:             "attachment",
+		AttachmentFilename: "tunnel.bin",
+		Subject:            config.DefaultMessageSubject,
+		SubjectMode:        config.MessageSubjectModeFixed,
+		SubjectClientID:    true,
+	}
 }
 
 // buildMessage wraps a binary frame in an RFC 5322 message body suitable
@@ -59,7 +83,12 @@ func defaultMessageOptions() MessageOptions {
 // "normal" mail to a human inspecting the folder. Both modes are
 // decoded identically by extractFrame (it just locates the body and
 // base64-decodes it after stripping whitespace).
-func buildMessage(frame []byte, date time.Time, opts MessageOptions) []byte {
+func buildMessage(frame []byte, date time.Time, opts MessageOptions) ([]byte, error) {
+	subject, err := messageSubject(opts)
+	if err != nil {
+		return nil, err
+	}
+
 	// Wrapped base64 of the frame.
 	enc := base64.StdEncoding.EncodeToString(frame)
 	var bodyB bytes.Buffer
@@ -75,7 +104,7 @@ func buildMessage(frame []byte, date time.Time, opts MessageOptions) []byte {
 	b.WriteString("From: tunnel@localhost\r\n")
 	b.WriteString("To: tunnel@localhost\r\n")
 	b.WriteString("Subject: ")
-	b.WriteString(messageMarker)
+	b.WriteString(subject)
 	b.WriteString("\r\n")
 	b.WriteString("Date: ")
 	b.WriteString(date.UTC().Format(time.RFC1123Z))
@@ -108,7 +137,85 @@ func buildMessage(frame []byte, date time.Time, opts MessageOptions) []byte {
 	}
 	b.WriteString("\r\n")
 	b.Write(bodyB.Bytes())
-	return b.Bytes()
+	return b.Bytes(), nil
+}
+
+func messageSubject(opts MessageOptions) (string, error) {
+	switch opts.SubjectMode {
+	case "", config.MessageSubjectModeFixed:
+		if strings.ContainsAny(opts.Subject, "\r\n") {
+			return "", fmt.Errorf("invalid message subject %q: must not contain CR or LF", opts.Subject)
+		}
+		subject := strings.TrimSpace(opts.Subject)
+		if subject == "" {
+			subject = config.DefaultMessageSubject
+		}
+		return subjectWithClientID(subject, opts), nil
+	case config.MessageSubjectModeRandom:
+		subject, err := randomMessageSubject()
+		if err != nil {
+			return "", err
+		}
+		return subjectWithClientID(subject, opts), nil
+	default:
+		return "", fmt.Errorf("invalid message subject mode %q", opts.SubjectMode)
+	}
+}
+
+func subjectWithClientID(subject string, opts MessageOptions) string {
+	if !opts.SubjectClientID || opts.ClientID == 0 {
+		return subject
+	}
+	return fmt.Sprintf("%02x %s", opts.ClientID, subject)
+}
+
+func subjectClientID(subject string) (byte, bool) {
+	subject = strings.TrimSpace(subject)
+	if len(subject) < subjectClientIDHexLen+1 || subject[subjectClientIDHexLen] != ' ' {
+		return 0, false
+	}
+	tag := subject[:subjectClientIDHexLen]
+	id, ok := parseHexByte(tag)
+	if !ok || id == 0 {
+		return 0, false
+	}
+	return id, true
+}
+
+func parseHexByte(s string) (byte, bool) {
+	if len(s) != 2 {
+		return 0, false
+	}
+	hi, ok := hexNibble(s[0])
+	if !ok {
+		return 0, false
+	}
+	lo, ok := hexNibble(s[1])
+	if !ok {
+		return 0, false
+	}
+	return hi<<4 | lo, true
+}
+
+func hexNibble(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+func randomMessageSubject() (string, error) {
+	var b [randomSubjectBytes]byte
+	if _, err := readRandom(b[:]); err != nil {
+		return "", fmt.Errorf("generate random message subject: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 // quoteMIMEParam escapes characters that would break a quoted-string

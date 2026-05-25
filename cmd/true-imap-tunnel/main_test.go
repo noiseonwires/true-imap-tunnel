@@ -56,7 +56,7 @@ func TestBuildClientVersionUsesBuildMetadata(t *testing.T) {
 func TestLoadSIP003ConfigClient(t *testing.T) {
 	t.Setenv("SS_LOCAL_HOST", "127.0.0.1")
 	t.Setenv("SS_LOCAL_PORT", "1081")
-	t.Setenv("SS_PLUGIN_OPTIONS", "imap_host=imap.example.com:993;imap_username=u;imap_password=p;folder_send=c2s;folder_recv=s2c;encryption_passphrase=secret;client_id=7;client_version=test-build")
+	t.Setenv("SS_PLUGIN_OPTIONS", "imap_host=imap.example.com:993;imap_username=u;imap_password=p;folder_send=c2s;folder_recv=s2c;encryption_passphrase=secret;client_encryption_passphrases=7:seven,8:eight;client_id=7;client_version=test-build;message_subject=Hello;message_subject_mode=random;subject_client_id=false")
 
 	cfg, err := loadSIP003Config()
 	if err != nil {
@@ -79,6 +79,15 @@ func TestLoadSIP003ConfigClient(t *testing.T) {
 	}
 	if cfg.ClientVersion != "test-build" {
 		t.Fatalf("client_version = %q", cfg.ClientVersion)
+	}
+	if cfg.MessageSubject != "Hello" || cfg.EffectiveMessageSubjectMode() != config.MessageSubjectModeRandom {
+		t.Fatalf("message subject config = %q/%q", cfg.MessageSubject, cfg.EffectiveMessageSubjectMode())
+	}
+	if cfg.SubjectClientID == nil || cfg.SubjectClientIDEnabled() {
+		t.Fatalf("subject_client_id = %v, want false", cfg.SubjectClientID)
+	}
+	if cfg.ClientEncryptionPassphrases[7] != "seven" || cfg.ClientEncryptionPassphrases[8] != "eight" {
+		t.Fatalf("client_encryption_passphrases = %#v", cfg.ClientEncryptionPassphrases)
 	}
 	if cfg.StatusAddr != diag.DefaultAndroidAddr {
 		t.Fatalf("status_addr = %q, want %q", cfg.StatusAddr, diag.DefaultAndroidAddr)
@@ -483,7 +492,7 @@ accounts:
 		t.Fatalf("decode config: %v", err)
 	}
 	text := string(data)
-	for _, omitted := range []string{"message_format", "ping_interval_ms", "batch_delay_ms", "tls:"} {
+	for _, omitted := range []string{"message_format", "message_subject", "subject_client_id", "ping_interval_ms", "batch_delay_ms", "tls:"} {
 		if strings.Contains(text, omitted) {
 			t.Fatalf("default key %q was not skipped:\n%s", omitted, text)
 		}

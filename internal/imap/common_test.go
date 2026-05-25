@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/true-imap-tunnel/true-imap-tunnel/internal/config"
 	"github.com/true-imap-tunnel/true-imap-tunnel/internal/protocol"
 )
 
@@ -20,7 +21,10 @@ func TestBuildAndExtractFrameRoundTrip(t *testing.T) {
 	for _, fmtName := range []string{"attachment", "text"} {
 		t.Run(fmtName, func(t *testing.T) {
 			opts := MessageOptions{Format: fmtName, AttachmentFilename: "my-custom.bin"}
-			msg := buildMessage(frameBytes, time.Unix(1700000000, 0), opts)
+			msg, err := buildMessage(frameBytes, time.Unix(1700000000, 0), opts)
+			if err != nil {
+				t.Fatalf("buildMessage: %v", err)
+			}
 			if !bytes.Contains(msg, []byte("Subject: TIT\r\n")) {
 				t.Errorf("missing marker subject")
 			}
@@ -67,15 +71,118 @@ func TestBuildAndExtractFrameRoundTrip(t *testing.T) {
 }
 
 func TestBuildMessageFilenameEscaped(t *testing.T) {
-	msg := buildMessage([]byte("x"), time.Unix(0, 0), MessageOptions{
+	msg, err := buildMessage([]byte("x"), time.Unix(0, 0), MessageOptions{
 		Format:             "attachment",
 		AttachmentFilename: `weird "name" with \backslash.dat`,
 	})
+	if err != nil {
+		t.Fatalf("buildMessage: %v", err)
+	}
 	// Embedded quotes and backslashes must be escaped in the MIME
 	// quoted-string parameter, otherwise the header is malformed.
 	want := `filename="weird \"name\" with \\backslash.dat"`
 	if !bytes.Contains(msg, []byte(want)) {
 		t.Errorf("filename not properly escaped in:\n%s", msg)
+	}
+}
+
+func TestBuildMessageCustomSubject(t *testing.T) {
+	msg, err := buildMessage([]byte("x"), time.Unix(0, 0), MessageOptions{
+		Subject: "hello tunnel",
+	})
+	if err != nil {
+		t.Fatalf("buildMessage: %v", err)
+	}
+	if !bytes.Contains(msg, []byte("Subject: hello tunnel\r\n")) {
+		t.Fatalf("custom subject missing:\n%s", msg)
+	}
+}
+
+func TestBuildMessageRandomSubject(t *testing.T) {
+	oldReadRandom := readRandom
+	defer func() { readRandom = oldReadRandom }()
+	readRandom = func(b []byte) (int, error) {
+		for i := range b {
+			b[i] = byte(i)
+		}
+		return len(b), nil
+	}
+
+	msg, err := buildMessage([]byte("x"), time.Unix(0, 0), MessageOptions{
+		SubjectMode: config.MessageSubjectModeRandom,
+	})
+	if err != nil {
+		t.Fatalf("buildMessage: %v", err)
+	}
+	if !bytes.Contains(msg, []byte("Subject: 000102030405060708090a0b0c0d0e0f\r\n")) {
+		t.Fatalf("random subject missing:\n%s", msg)
+	}
+}
+
+func TestBuildMessageSubjectClientID(t *testing.T) {
+	msg, err := buildMessage([]byte("x"), time.Unix(0, 0), MessageOptions{
+		Subject:         "hello tunnel",
+		ClientID:        7,
+		SubjectClientID: true,
+	})
+	if err != nil {
+		t.Fatalf("buildMessage: %v", err)
+	}
+	if !bytes.Contains(msg, []byte("Subject: 07 hello tunnel\r\n")) {
+		t.Fatalf("client-id subject missing:\n%s", msg)
+	}
+}
+
+func TestBuildMessageRandomSubjectClientID(t *testing.T) {
+	oldReadRandom := readRandom
+	defer func() { readRandom = oldReadRandom }()
+	readRandom = func(b []byte) (int, error) {
+		for i := range b {
+			b[i] = byte(i)
+		}
+		return len(b), nil
+	}
+
+	msg, err := buildMessage([]byte("x"), time.Unix(0, 0), MessageOptions{
+		SubjectMode:     config.MessageSubjectModeRandom,
+		ClientID:        7,
+		SubjectClientID: true,
+	})
+	if err != nil {
+		t.Fatalf("buildMessage: %v", err)
+	}
+	if !bytes.Contains(msg, []byte("Subject: 07 000102030405060708090a0b0c0d0e0f\r\n")) {
+		t.Fatalf("random client-id subject missing:\n%s", msg)
+	}
+}
+
+func TestSubjectClientIDParsing(t *testing.T) {
+	tests := []struct {
+		subject string
+		want    byte
+		wantOK  bool
+	}{
+		{subject: "07 hello tunnel", want: 7, wantOK: true},
+		{subject: "ff random", want: 255, wantOK: true},
+		{subject: "TIT", wantOK: false},
+		{subject: "Re: 07 hello tunnel", wantOK: false},
+		{subject: "zz hello tunnel", wantOK: false},
+		{subject: "0700000000000000 hello tunnel", wantOK: false},
+		{subject: "00 hello tunnel", wantOK: false},
+	}
+	for _, tc := range tests {
+		got, ok := subjectClientID(tc.subject)
+		if got != tc.want || ok != tc.wantOK {
+			t.Fatalf("subjectClientID(%q) = %d/%v, want %d/%v", tc.subject, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}
+
+func TestBuildMessageRejectsHeaderInjectionSubject(t *testing.T) {
+	if _, err := buildMessage([]byte("x"), time.Unix(0, 0), MessageOptions{
+		Subject: "safe\r\nInjected: yes",
+	}); err == nil {
+		t.Fatal("buildMessage accepted subject containing CRLF")
 	}
 }
 

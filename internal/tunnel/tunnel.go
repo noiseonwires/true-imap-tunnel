@@ -78,13 +78,18 @@ type bufferedEvent struct {
 // New constructs a Tunnel. Returns an error if encryption configuration
 // is invalid.
 func New(cfg *config.Config) (*Tunnel, error) {
-	aead, err := titcrypto.New(cfg.EncryptionPassphrase)
+	keys, err := titcrypto.NewKeyRing(cfg.EncryptionPassphrase, cfg.ClientEncryptionPassphrases)
 	if err != nil {
 		return nil, fmt.Errorf("encryption setup: %w", err)
 	}
-	if aead.Enabled() {
-		tlog.Infof("encryption: AES-256-GCM enabled (passphrase-derived key, %dB overhead/frame)",
-			aead.Overhead())
+	if keys.Enabled() {
+		if keys.ClientKeys() > 0 {
+			tlog.Infof("encryption: AES-256-GCM enabled (%d client key(s), %dB overhead/frame)",
+				keys.ClientKeys(), keys.Overhead())
+		} else {
+			tlog.Infof("encryption: AES-256-GCM enabled (passphrase-derived key, %dB overhead/frame)",
+				keys.Overhead())
+		}
 	}
 
 	t := &Tunnel{
@@ -125,7 +130,7 @@ func New(cfg *config.Config) (*Tunnel, error) {
 		}
 	}
 
-	t.paths = NewMultipath(cfg, t.handleIncomingFrame, filter, aead)
+	t.paths = NewMultipath(cfg, t.handleIncomingFrame, filter, keys)
 	t.paths.OnAsyncSendError = t.handleAsyncSendError
 	// Drop the route entry when a stream is removed, so the route table
 	// doesn't grow without bound.

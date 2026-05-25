@@ -37,6 +37,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"sync"
 )
 
 // AEAD is a frame-level encrypt/decrypt helper.
@@ -49,6 +50,16 @@ import (
 // without first checking whether encryption is configured.
 type AEAD struct {
 	aead cipher.AEAD
+}
+
+// KeyRing selects a frame encryption key by stream client ID. It preserves the
+// historical single-key behavior through defaultKey while allowing servers to
+// use per-client keys for non-zero client IDs.
+type KeyRing struct {
+	defaultKey *AEAD
+	clients    map[byte]*AEAD
+	recentMu   sync.Mutex
+	recent     []byte
 }
 
 // New derives a key from the passphrase (SHA-256) and returns an
@@ -69,9 +80,45 @@ func New(passphrase string) (*AEAD, error) {
 	return &AEAD{aead: gcm}, nil
 }
 
+// NewKeyRing builds a key ring from the default passphrase and optional
+// per-client passphrases. Empty passphrases disable that key.
+func NewKeyRing(defaultPassphrase string, clientPassphrases map[byte]string) (*KeyRing, error) {
+	defaultKey, err := New(defaultPassphrase)
+	if err != nil {
+		return nil, err
+	}
+	clients := make(map[byte]*AEAD, len(clientPassphrases))
+	for id, passphrase := range clientPassphrases {
+		key, err := New(passphrase)
+		if err != nil {
+			return nil, fmt.Errorf("client %d: %w", id, err)
+		}
+		if key != nil {
+			clients[id] = key
+		}
+	}
+	if defaultKey == nil && len(clients) == 0 {
+		return nil, nil
+	}
+	return &KeyRing{defaultKey: defaultKey, clients: clients}, nil
+}
+
 // Enabled reports whether encryption is configured. A nil receiver
 // returns false.
 func (a *AEAD) Enabled() bool { return a != nil }
+
+// Enabled reports whether any encryption key is configured.
+func (r *KeyRing) Enabled() bool {
+	return r != nil && (r.defaultKey != nil || len(r.clients) > 0)
+}
+
+// ClientKeys reports the number of configured per-client keys.
+func (r *KeyRing) ClientKeys() int {
+	if r == nil {
+		return 0
+	}
+	return len(r.clients)
+}
 
 // Overhead returns the per-frame ciphertext expansion (nonce + auth tag).
 // Useful for size accounting; returns 0 when disabled.
@@ -80,6 +127,20 @@ func (a *AEAD) Overhead() int {
 		return 0
 	}
 	return a.aead.NonceSize() + a.aead.Overhead()
+}
+
+// Overhead returns the per-frame ciphertext expansion for enabled keys.
+func (r *KeyRing) Overhead() int {
+	if r == nil {
+		return 0
+	}
+	if r.defaultKey != nil {
+		return r.defaultKey.Overhead()
+	}
+	for _, key := range r.clients {
+		return key.Overhead()
+	}
+	return 0
 }
 
 // Encrypt seals plaintext with a fresh random nonce. The returned
@@ -101,6 +162,25 @@ func (a *AEAD) Encrypt(plaintext []byte) ([]byte, error) {
 	return a.aead.Seal(dst, nonce, plaintext, nil), nil
 }
 
+// Encrypt seals plaintext with the per-client key when clientID is non-zero
+// and configured. Otherwise it uses the default key. If per-client keys are
+// configured and no key exists for a non-zero clientID, encryption fails unless
+// a default key is available for legacy fallback.
+func (r *KeyRing) Encrypt(plaintext []byte, clientID byte) ([]byte, error) {
+	if r == nil {
+		return plaintext, nil
+	}
+	if clientID != 0 {
+		if key := r.clients[clientID]; key != nil {
+			return key.Encrypt(plaintext)
+		}
+		if len(r.clients) > 0 && r.defaultKey == nil {
+			return nil, fmt.Errorf("missing encryption key for client_id %d", clientID)
+		}
+	}
+	return r.defaultKey.Encrypt(plaintext)
+}
+
 // Decrypt parses nonce || ciphertext+tag and returns the plaintext.
 // Returns an error when the auth tag doesn't verify, which covers
 // both tampering and wrong-key (mismatched-config) cases.
@@ -120,4 +200,95 @@ func (a *AEAD) Decrypt(blob []byte) ([]byte, error) {
 		return nil, fmt.Errorf("aead open: %w", err)
 	}
 	return pt, nil
+}
+
+// Decrypt opens blob. If hintClientID names a configured per-client key, that
+// key is tried first. The returned keyClientID is non-zero only when a
+// per-client key succeeded; callers can verify decoded frames match it.
+func (r *KeyRing) Decrypt(blob []byte, hintClientID byte) ([]byte, byte, error) {
+	if r == nil {
+		return blob, 0, nil
+	}
+	if hintClientID != 0 {
+		if key := r.clients[hintClientID]; key != nil {
+			pt, err := key.Decrypt(blob)
+			if err == nil {
+				r.promoteRecent(hintClientID)
+				return pt, hintClientID, nil
+			}
+			if r.defaultKey == nil {
+				return nil, 0, err
+			}
+		}
+	}
+	if r.defaultKey != nil {
+		pt, err := r.defaultKey.Decrypt(blob)
+		if err == nil {
+			return pt, 0, nil
+		}
+	}
+	recent := r.recentClientIDs()
+	for _, id := range recent {
+		if id == hintClientID {
+			continue
+		}
+		key := r.clients[id]
+		if key == nil {
+			continue
+		}
+		pt, err := key.Decrypt(blob)
+		if err == nil {
+			r.promoteRecent(id)
+			return pt, id, nil
+		}
+	}
+	for id, key := range r.clients {
+		if id == hintClientID || containsClientID(recent, id) {
+			continue
+		}
+		pt, err := key.Decrypt(blob)
+		if err == nil {
+			r.promoteRecent(id)
+			return pt, id, nil
+		}
+	}
+	return nil, 0, errors.New("no configured encryption key could decrypt frame")
+}
+
+func (r *KeyRing) promoteRecent(clientID byte) {
+	if r == nil || clientID == 0 {
+		return
+	}
+	r.recentMu.Lock()
+	defer r.recentMu.Unlock()
+	for i, id := range r.recent {
+		if id == clientID {
+			copy(r.recent[1:i+1], r.recent[:i])
+			r.recent[0] = clientID
+			return
+		}
+	}
+	r.recent = append(r.recent, 0)
+	copy(r.recent[1:], r.recent[:len(r.recent)-1])
+	r.recent[0] = clientID
+}
+
+func (r *KeyRing) recentClientIDs() []byte {
+	if r == nil {
+		return nil
+	}
+	r.recentMu.Lock()
+	defer r.recentMu.Unlock()
+	out := make([]byte, len(r.recent))
+	copy(out, r.recent)
+	return out
+}
+
+func containsClientID(ids []byte, clientID byte) bool {
+	for _, id := range ids {
+		if id == clientID {
+			return true
+		}
+	}
+	return false
 }

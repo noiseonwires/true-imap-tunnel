@@ -53,6 +53,18 @@ const (
 	StartupCleanupConnectionFallback StartupCleanupConnection = "fallback"
 )
 
+// MessageSubjectMode controls how Subject headers are generated.
+type MessageSubjectMode string
+
+const (
+	// MessageSubjectModeFixed uses the configured message_subject.
+	MessageSubjectModeFixed MessageSubjectMode = "fixed"
+	// MessageSubjectModeRandom generates a fresh random subject per message.
+	MessageSubjectModeRandom MessageSubjectMode = "random"
+)
+
+const DefaultMessageSubject = "TIT"
+
 // AccountConfig is a single IMAP account participating in the tunnel.
 //
 // Each account contributes one independent transport path. Configuring
@@ -274,6 +286,20 @@ type Config struct {
 	// in the attachment UI instead of "Untitled.bin".
 	AttachmentFilename string `yaml:"attachment_filename"`
 
+	// MessageSubject is the Subject header used when MessageSubjectMode is
+	// "fixed". Default "TIT", preserving the historical hardcoded marker.
+	MessageSubject string `yaml:"message_subject"`
+
+	// MessageSubjectMode selects fixed or per-message random Subject headers.
+	// The receiver ignores Subject, so endpoints do not have to match.
+	MessageSubjectMode MessageSubjectMode `yaml:"message_subject_mode"`
+
+	// SubjectClientID prefixes each Subject with the frame's client ID so
+	// multi-client receivers can reject other clients' messages after a
+	// lightweight header fetch. Default true; set false to avoid leaking
+	// client IDs in mail headers.
+	SubjectClientID *bool `yaml:"subject_client_id"`
+
 	// EncryptionPassphrase enables AES-256-GCM encryption of the frame
 	// bytes carried inside each IMAP message. The passphrase is hashed
 	// (SHA-256) to derive the 32-byte key; both sides of the tunnel
@@ -288,6 +314,13 @@ type Config struct {
 	//
 	// Empty disables encryption.
 	EncryptionPassphrase string `yaml:"encryption_passphrase"`
+
+	// ClientEncryptionPassphrases maps stream client IDs to dedicated
+	// passphrases. It is intended for server mode in multi-client
+	// deployments: each client keeps using encryption_passphrase with only
+	// its own secret, while the server selects the matching key by client ID.
+	// A global EncryptionPassphrase may still be set as a legacy fallback.
+	ClientEncryptionPassphrases map[byte]string `yaml:"client_encryption_passphrases"`
 
 	// DNSServers, when non-empty, replaces Go's default resolver with
 	// a custom one that dials these servers directly instead of
@@ -594,6 +627,38 @@ func (c *Config) EffectiveAttachmentFilename() string {
 	return "tunnel.bin"
 }
 
+// EffectiveMessageSubject returns the fixed Subject header value, defaulting
+// to the historical "TIT" marker when unset.
+func (c *Config) EffectiveMessageSubject() string {
+	if s := strings.TrimSpace(c.MessageSubject); s != "" {
+		return s
+	}
+	return DefaultMessageSubject
+}
+
+// EffectiveMessageSubjectMode returns the Subject generation mode, normalized
+// to lowercase and defaulted to "fixed".
+func (c *Config) EffectiveMessageSubjectMode() MessageSubjectMode {
+	switch mode := MessageSubjectMode(strings.ToLower(strings.TrimSpace(string(c.MessageSubjectMode)))); mode {
+	case "", MessageSubjectModeFixed:
+		return MessageSubjectModeFixed
+	case MessageSubjectModeRandom:
+		return MessageSubjectModeRandom
+	default:
+		return mode
+	}
+}
+
+// SubjectClientIDEnabled reports whether messages should include a parseable
+// client-ID tag in the Subject header. It defaults on for compatibility with
+// newer multi-client receivers while remaining opt-out.
+func (c *Config) SubjectClientIDEnabled() bool {
+	if c.SubjectClientID == nil {
+		return true
+	}
+	return *c.SubjectClientID
+}
+
 // GracefulShutdown returns how long the tunnel may spend emitting RSTs
 // on exit. Zero / negative means skip the courtesy notification.
 func (c *Config) GracefulShutdown() time.Duration {
@@ -765,6 +830,22 @@ func (c *Config) Validate() error {
 	case "attachment", "text":
 	default:
 		return fmt.Errorf("invalid message_format %q (expected \"attachment\" or \"text\")", c.MessageFormat)
+	}
+	switch c.EffectiveMessageSubjectMode() {
+	case MessageSubjectModeFixed, MessageSubjectModeRandom:
+	default:
+		return fmt.Errorf("invalid message_subject_mode %q (expected \"fixed\" or \"random\")", c.MessageSubjectMode)
+	}
+	if strings.ContainsAny(c.MessageSubject, "\r\n") {
+		return fmt.Errorf("invalid message_subject %q (must not contain CR or LF)", c.MessageSubject)
+	}
+	for id, passphrase := range c.ClientEncryptionPassphrases {
+		if id == 0 {
+			return fmt.Errorf("invalid client_encryption_passphrases key 0 (expected 1-255)")
+		}
+		if strings.TrimSpace(passphrase) == "" {
+			return fmt.Errorf("invalid client_encryption_passphrases[%d]: passphrase must not be empty", id)
+		}
 	}
 	switch c.EffectiveMultipathMode() {
 	case MultipathModeStreamAffinity, MultipathModeFrameRoundRobin:

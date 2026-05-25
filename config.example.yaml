@@ -220,6 +220,14 @@ ping_interval_ms: 0
 #
 # Empty = disabled (default).
 # encryption_passphrase: "correct horse battery staple"
+#
+# Server-only: optional per-client encryption keys for multi-client setups.
+# Clients still configure only their own encryption_passphrase; the server maps
+# each client_id to its passphrase and falls back to encryption_passphrase for
+# unmapped clients.
+# client_encryption_passphrases:
+#   1: "client-1-secret"
+#   2: "client-2-secret"
 
 # Optional PID file. When set, startup removes a stale still-running tunnel
 # process recorded in this file before binding the listen port, then deletes
@@ -304,9 +312,25 @@ inbound_queue_size: 64
 # immediately instead of waiting.
 inbound_queue_wait_ms: 30000
 
-# How the IMAP message body carrying each frame is structured. Both modes
-# encode the frame in base64; the difference is purely in how the message
-# *looks* in a mail client browsing the folder.
+# How each IMAP draft carrying a frame looks in a mail client.
+#
+# Subject:
+#   message_subject is used when message_subject_mode is "fixed" (default).
+#   The historical hardcoded subject was "TIT"; change it to anything
+#   innocuous for your mailbox. CR/LF are rejected.
+#   Set message_subject_mode: random to generate a fresh random hex subject
+#   for every draft. The receiver ignores Subject, so peers do not have to
+#   agree on these values.
+#   subject_client_id prefixes drafts with a two-hex-digit client ID token
+#   (default true), so multi-client receivers can skip other clients' messages
+#   after fetching headers only. Set false if exposing client IDs in Subject
+#   headers is a concern; receivers will fall back to body decode/filtering.
+message_subject: "TIT"
+message_subject_mode: fixed
+subject_client_id: true
+
+# Body format. Both modes encode the frame in base64; the difference is
+# purely in how the message *looks* in a mail client browsing the folder.
 #
 #   "attachment" (default): the body is a binary attachment
 #     (Content-Type: application/octet-stream). Mail clients show a

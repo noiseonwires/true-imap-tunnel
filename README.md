@@ -58,7 +58,7 @@ Optional `encryption_passphrase` enables AES-256-GCM frame encryption before
 frames are stored in IMAP. Empty passphrase means encryption is disabled.
 
 To change how each tunnel draft looks to anyone browsing the IMAP folder in a
-normal mail client (attachment vs plain-text body, custom filename), see
+normal mail client (subject, attachment vs plain-text body, custom filename), see
 [`docs/configuration.md`](docs/configuration.md#customizing-how-messages-look-in-the-mailbox).
 
 ## Build

@@ -1683,6 +1683,107 @@ func TestEndToEnd_MultiClient(t *testing.T) {
 	wg.Wait()
 }
 
+func TestEndToEnd_MultiClientPerClientEncryption(t *testing.T) {
+	t.Parallel()
+
+	imapAddr := startMemIMAP(t)
+	echoAddr := startEchoServer(t)
+	listen1 := freePort(t)
+	listen2 := freePort(t)
+
+	mkClient := func(listen string, clientID uint8, passphrase string) *Tunnel {
+		rt := true
+		cfg := &config.Config{
+			Mode:                 config.ModeClient,
+			Listen:               listen,
+			ClientID:             clientID,
+			EncryptionPassphrase: passphrase,
+			Accounts: []config.AccountConfig{
+				makeAccount(imapAddr, "Tunnel.C2S", "Tunnel.S2C"),
+			},
+			Reorder: &rt,
+		}
+		return mustNew(t, cfg)
+	}
+
+	rt := true
+	serverCfg := &config.Config{
+		Mode:   config.ModeServer,
+		Target: echoAddr,
+		ClientEncryptionPassphrases: map[byte]string{
+			1: "client-one-secret",
+			2: "client-two-secret",
+		},
+		Accounts: []config.AccountConfig{
+			makeAccount(imapAddr, "Tunnel.S2C", "Tunnel.C2S"),
+		},
+		Reorder: &rt,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	server := mustNew(t, serverCfg)
+	client1 := mkClient(listen1, 1, "client-one-secret")
+	client2 := mkClient(listen2, 2, "client-two-secret")
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { defer wg.Done(); _ = server.Run(ctx) }()
+	go func() { defer wg.Done(); _ = client1.Run(ctx) }()
+	go func() { defer wg.Done(); _ = client2.Run(ctx) }()
+
+	waitForListen(t, listen1, 10*time.Second, client1, server)
+	waitForListen(t, listen2, 10*time.Second, client2, server)
+	time.Sleep(1 * time.Second)
+
+	rounds := []struct {
+		name    string
+		listen  string
+		payload []byte
+	}{
+		{"client1", listen1, []byte("encrypted client 1\n")},
+		{"client2", listen2, []byte("encrypted client 2\n")},
+	}
+	var errs sync.Map
+	var swg sync.WaitGroup
+	for _, r := range rounds {
+		r := r
+		swg.Add(1)
+		go func() {
+			defer swg.Done()
+			conn, err := net.Dial("tcp", r.listen)
+			if err != nil {
+				errs.Store(r.name, fmt.Errorf("dial: %w", err))
+				return
+			}
+			defer conn.Close()
+			if _, err := conn.Write(r.payload); err != nil {
+				errs.Store(r.name, fmt.Errorf("write: %w", err))
+				return
+			}
+			buf := make([]byte, len(r.payload))
+			_ = conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				errs.Store(r.name, fmt.Errorf("read: %w", err))
+				return
+			}
+			if string(buf) != string(r.payload) {
+				errs.Store(r.name, fmt.Errorf("mismatch: got %q want %q", buf, r.payload))
+			}
+		}()
+	}
+	swg.Wait()
+
+	errs.Range(func(k, v any) bool {
+		t.Errorf("%s: %v", k, v)
+		return true
+	})
+
+	cancel()
+	wg.Wait()
+}
+
 // TestEndToEnd_CrossStreamBatching verifies that when multiple TCP
 // streams write concurrently the sender packs their frames into fewer
 // IMAP APPENDs than the total frame count. The single-account /

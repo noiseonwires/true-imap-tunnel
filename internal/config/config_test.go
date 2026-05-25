@@ -74,3 +74,77 @@ func TestStartupCleanupConnectionInvalid(t *testing.T) {
 		t.Fatal("LoadBytes accepted invalid startup_cleanup_connection")
 	}
 }
+
+func TestMessageSubjectDefault(t *testing.T) {
+	cfg, err := LoadBytes([]byte(batchDelayConfigBase))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.EffectiveMessageSubject(); got != DefaultMessageSubject {
+		t.Fatalf("EffectiveMessageSubject() = %q, want %q", got, DefaultMessageSubject)
+	}
+	if got := cfg.EffectiveMessageSubjectMode(); got != MessageSubjectModeFixed {
+		t.Fatalf("EffectiveMessageSubjectMode() = %q, want %q", got, MessageSubjectModeFixed)
+	}
+	if !cfg.SubjectClientIDEnabled() {
+		t.Fatal("SubjectClientIDEnabled() = false, want default true")
+	}
+}
+
+func TestMessageSubjectCustom(t *testing.T) {
+	cfg, err := LoadBytes([]byte("message_subject: \"Quarterly update\"\n" + batchDelayConfigBase))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.EffectiveMessageSubject(); got != "Quarterly update" {
+		t.Fatalf("EffectiveMessageSubject() = %q, want custom subject", got)
+	}
+}
+
+func TestMessageSubjectRandomMode(t *testing.T) {
+	cfg, err := LoadBytes([]byte("message_subject_mode: random\n" + batchDelayConfigBase))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.EffectiveMessageSubjectMode(); got != MessageSubjectModeRandom {
+		t.Fatalf("EffectiveMessageSubjectMode() = %q, want %q", got, MessageSubjectModeRandom)
+	}
+}
+
+func TestMessageSubjectInvalidMode(t *testing.T) {
+	if _, err := LoadBytes([]byte("message_subject_mode: rotating\n" + batchDelayConfigBase)); err == nil {
+		t.Fatal("LoadBytes accepted invalid message_subject_mode")
+	}
+}
+
+func TestMessageSubjectRejectsCRLF(t *testing.T) {
+	if _, err := LoadBytes([]byte("message_subject: \"ok\\r\\nInjected: yes\"\n" + batchDelayConfigBase)); err == nil {
+		t.Fatal("LoadBytes accepted message_subject containing CRLF")
+	}
+}
+
+func TestSubjectClientIDDisabled(t *testing.T) {
+	cfg, err := LoadBytes([]byte("subject_client_id: false\n" + batchDelayConfigBase))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SubjectClientIDEnabled() {
+		t.Fatal("SubjectClientIDEnabled() = true, want false")
+	}
+}
+
+func TestClientEncryptionPassphrases(t *testing.T) {
+	cfg, err := LoadBytes([]byte("client_encryption_passphrases:\n  7: seven-secret\n  8: eight-secret\n" + batchDelayConfigBase))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ClientEncryptionPassphrases[7] != "seven-secret" || cfg.ClientEncryptionPassphrases[8] != "eight-secret" {
+		t.Fatalf("client encryption passphrases = %#v", cfg.ClientEncryptionPassphrases)
+	}
+}
+
+func TestClientEncryptionPassphrasesRejectZero(t *testing.T) {
+	if _, err := LoadBytes([]byte("client_encryption_passphrases:\n  0: zero-secret\n" + batchDelayConfigBase)); err == nil {
+		t.Fatal("LoadBytes accepted client_encryption_passphrases key 0")
+	}
+}

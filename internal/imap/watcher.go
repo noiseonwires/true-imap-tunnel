@@ -32,6 +32,14 @@ type FrameHandler func(f protocol.Frame, sourceAccount string)
 // A nil filter accepts every frame (the single-client / server default).
 type FrameFilter func(f protocol.Frame) bool
 
+type processResult struct {
+	owned       imap.UIDSet
+	maxUID      imap.UID
+	ownedCount  int
+	skipCount   int
+	fetchedBody int
+}
+
 // Watcher owns one IMAP connection used exclusively for receiving frames.
 // It selects FolderRecv, runs an IDLE loop, fetches new messages on
 // notification, dispatches owned frames, and deletes only the messages
@@ -43,11 +51,15 @@ type Watcher struct {
 	acc     *config.AccountConfig
 	cfg     *config.Config
 	handler FrameHandler
-	aead    *titcrypto.AEAD
+	keys    *titcrypto.KeyRing
 
 	// Filter, if set, is consulted for every fetched message. Frames it
 	// rejects are left in the folder.
 	Filter FrameFilter
+
+	// SubjectClientID, when non-zero, lets the watcher skip other clients'
+	// messages using only FETCH ENVELOPE before downloading message bodies.
+	SubjectClientID byte
 
 	notify chan struct{}
 	kick   chan struct{}
@@ -101,14 +113,14 @@ type Watcher struct {
 	failDelay time.Duration
 }
 
-// NewWatcher constructs (but does not connect) a Watcher. aead may be
+// NewWatcher constructs (but does not connect) a Watcher. keys may be
 // nil to disable per-frame decryption.
-func NewWatcher(cfg *config.Config, acc *config.AccountConfig, handler FrameHandler, aead *titcrypto.AEAD) *Watcher {
+func NewWatcher(cfg *config.Config, acc *config.AccountConfig, handler FrameHandler, keys *titcrypto.KeyRing) *Watcher {
 	w := &Watcher{
 		acc:       acc,
 		cfg:       cfg,
 		handler:   handler,
-		aead:      aead,
+		keys:      keys,
 		notify:    make(chan struct{}, 1),
 		kick:      make(chan struct{}, 1),
 		failDelay: cfg.ReconnectInitialDelay(),
@@ -465,6 +477,89 @@ func (w *Watcher) processRange(ctx context.Context, uidSet imap.UIDSet, dispatch
 		return 0, errors.New("not connected")
 	}
 
+	var (
+		res processResult
+		err error
+	)
+	if w.prefetchSubjects() {
+		res, err = w.processRangeBySubject(c, uidSet, dispatch)
+	} else {
+		res, err = w.fetchAndProcessBodies(c, uidSet, nil, dispatch)
+	}
+	if err != nil {
+		return res.maxUID, err
+	}
+	return w.finishProcessRange(c, res, dispatch)
+}
+
+func (w *Watcher) processRangeBySubject(c *imapclient.Client, uidSet imap.UIDSet, dispatch bool) (processResult, error) {
+	fetchOpts := &imap.FetchOptions{
+		UID:      true,
+		Envelope: true,
+	}
+	fetchStart := time.Now()
+	fetchCmd := c.Fetch(uidSet, fetchOpts)
+	defer fetchCmd.Close()
+
+	var res processResult
+	candidates := imap.UIDSet{}
+	clientIDHints := map[imap.UID]byte{}
+	for {
+		msg := fetchCmd.Next()
+		if msg == nil {
+			break
+		}
+		buf, err := msg.Collect()
+		if err != nil {
+			tlog.Warnf("watcher %s: subject fetch collect failed: %v",
+				w.acc.Label(), err)
+			continue
+		}
+		if buf.UID == 0 {
+			continue
+		}
+		if buf.UID > res.maxUID {
+			res.maxUID = buf.UID
+		}
+
+		subject := ""
+		if buf.Envelope != nil {
+			subject = buf.Envelope.Subject
+		}
+		clientID, tagged := subjectClientID(subject)
+		if w.SubjectClientID != 0 && tagged && clientID != w.SubjectClientID {
+			res.skipCount++
+			continue
+		}
+		candidates.AddNum(buf.UID)
+		if tagged {
+			clientIDHints[buf.UID] = clientID
+		}
+	}
+	if err := fetchCmd.Close(); err != nil {
+		return res, fmt.Errorf("subject fetch close: %w", err)
+	}
+	if tlog.Enabled(tlog.LevelTrace) && (len(candidates) > 0 || res.skipCount > 0) {
+		tlog.Tracef("watcher %s: FETCH ENVELOPE %s elapsed=%v candidates=%d skipped=%d",
+			w.acc.Label(), uidSet.String(),
+			time.Since(fetchStart).Round(time.Millisecond), len(candidates), res.skipCount)
+	}
+	if len(candidates) == 0 {
+		return res, nil
+	}
+
+	bodyRes, err := w.fetchAndProcessBodies(c, candidates, clientIDHints, dispatch)
+	if bodyRes.maxUID > res.maxUID {
+		res.maxUID = bodyRes.maxUID
+	}
+	res.owned.AddSet(bodyRes.owned)
+	res.ownedCount += bodyRes.ownedCount
+	res.skipCount += bodyRes.skipCount
+	res.fetchedBody += bodyRes.fetchedBody
+	return res, err
+}
+
+func (w *Watcher) fetchAndProcessBodies(c *imapclient.Client, uidSet imap.UIDSet, clientIDHints map[imap.UID]byte, dispatch bool) (processResult, error) {
 	fetchOpts := &imap.FetchOptions{
 		UID:         true,
 		BodySection: []*imap.FetchItemBodySection{{Peek: true}},
@@ -473,14 +568,7 @@ func (w *Watcher) processRange(ctx context.Context, uidSet imap.UIDSet, dispatch
 	fetchCmd := c.Fetch(uidSet, fetchOpts)
 	defer fetchCmd.Close()
 
-	var (
-		owned       = imap.UIDSet{}
-		maxUID      imap.UID
-		ownedCount  int
-		skipCount   int
-		fetchedBody int
-	)
-
+	res := processResult{owned: imap.UIDSet{}}
 	for {
 		msg := fetchCmd.Next()
 		if msg == nil {
@@ -495,8 +583,8 @@ func (w *Watcher) processRange(ctx context.Context, uidSet imap.UIDSet, dispatch
 		if buf.UID == 0 {
 			continue
 		}
-		if buf.UID > maxUID {
-			maxUID = buf.UID
+		if buf.UID > res.maxUID {
+			res.maxUID = buf.UID
 		}
 		body := findBodySectionBytes(buf.BodySection)
 		if body == nil {
@@ -504,24 +592,30 @@ func (w *Watcher) processRange(ctx context.Context, uidSet imap.UIDSet, dispatch
 				w.acc.Label(), buf.UID)
 			// Malformed message — treat as owned for cleanup purposes;
 			// otherwise it would sit in the folder forever.
-			owned.AddNum(buf.UID)
+			res.owned.AddNum(buf.UID)
+			res.ownedCount++
 			continue
 		}
-		frames, malformed := w.decodeFrames(body, buf.UID)
+		frames, malformed, retain := w.decodeFrames(body, buf.UID, clientIDHints[buf.UID])
+		if retain {
+			res.skipCount++
+			continue
+		}
 		if malformed {
-			owned.AddNum(buf.UID)
+			res.owned.AddNum(buf.UID)
+			res.ownedCount++
 			continue
 		}
 
 		// Filter is checked on the first frame; the sender guarantees
 		// every frame in one batch targets the same client ID.
 		if w.Filter != nil && len(frames) > 0 && !w.Filter(frames[0]) {
-			skipCount++
+			res.skipCount++
 			continue
 		}
 
-		owned.AddNum(buf.UID)
-		ownedCount++
+		res.owned.AddNum(buf.UID)
+		res.ownedCount++
 
 		if !dispatch {
 			continue
@@ -546,28 +640,32 @@ func (w *Watcher) processRange(ctx context.Context, uidSet imap.UIDSet, dispatch
 				tlog.Tracef("watcher %s: rx DATA stream=%d seq=%d payload=%dB",
 					w.acc.Label(), f.StreamID, f.SeqID, len(f.Payload))
 			}
-			fetchedBody += len(f.Payload)
+			res.fetchedBody += len(f.Payload)
 			w.framesReceived.Add(1)
 			w.lastFrameAtNS.Store(time.Now().UnixNano())
 			w.handler(f, w.acc.Label())
 		}
 	}
 	if err := fetchCmd.Close(); err != nil {
-		return maxUID, fmt.Errorf("fetch close: %w", err)
+		return res, fmt.Errorf("fetch close: %w", err)
 	}
 	fetchElapsed := time.Since(fetchStart)
-	if tlog.Enabled(tlog.LevelTrace) && (ownedCount > 0 || skipCount > 0) {
+	if tlog.Enabled(tlog.LevelTrace) && (res.ownedCount > 0 || res.skipCount > 0) {
 		tlog.Tracef("watcher %s: FETCH %s elapsed=%v owned=%d skipped=%d bytes=%d",
 			w.acc.Label(), uidSet.String(),
-			fetchElapsed.Round(time.Millisecond), ownedCount, skipCount, fetchedBody)
+			fetchElapsed.Round(time.Millisecond), res.ownedCount, res.skipCount, res.fetchedBody)
 	}
 
-	if ownedCount == 0 {
-		if skipCount > 0 {
+	return res, nil
+}
+
+func (w *Watcher) finishProcessRange(c *imapclient.Client, res processResult, dispatch bool) (imap.UID, error) {
+	if res.ownedCount == 0 {
+		if res.skipCount > 0 {
 			tlog.Debugf("watcher %s: skipped %d non-owned message(s)",
-				w.acc.Label(), skipCount)
+				w.acc.Label(), res.skipCount)
 		}
-		return maxUID, nil
+		return res.maxUID, nil
 	}
 
 	// Mark owned messages \Deleted. We do NOT issue EXPUNGE here on
@@ -584,15 +682,15 @@ func (w *Watcher) processRange(ctx context.Context, uidSet imap.UIDSet, dispatch
 		Silent: true,
 		Flags:  []imap.Flag{imap.FlagDeleted},
 	}
-	storeCmd := c.Store(owned, storeFlags, nil)
+	storeCmd := c.Store(res.owned, storeFlags, nil)
 
 	// Decide *before* waiting for STORE whether to also flush the
 	// pending expunge in the same network round. When yes, both
 	// commands are placed on the wire back-to-back; the server processes
 	// them in order and we wait once at the end. That collapses what
 	// would be two sequential round-trips into one.
-	w.pendingExpunge.AddSet(owned)
-	w.pendingCount += ownedCount
+	w.pendingExpunge.AddSet(res.owned)
+	w.pendingCount += res.ownedCount
 	shouldExpunge := w.shouldFlushPendingExpunge()
 	var expungePending imap.UIDSet
 	var expungeCmd *imapclient.ExpungeCommand
@@ -616,14 +714,14 @@ func (w *Watcher) processRange(ctx context.Context, uidSet imap.UIDSet, dispatch
 
 	storeStart := time.Now()
 	if err := storeCmd.Close(); err != nil {
-		return maxUID, fmt.Errorf("store \\Deleted: %w", err)
+		return res.maxUID, fmt.Errorf("store \\Deleted: %w", err)
 	}
 	storeElapsed := time.Since(storeStart)
 	var expungeElapsed time.Duration
 	if expungeCmd != nil {
 		expungeStart := time.Now()
 		if _, err := expungeCmd.Collect(); err != nil {
-			return maxUID, fmt.Errorf("expunge: %w", err)
+			return res.maxUID, fmt.Errorf("expunge: %w", err)
 		}
 		expungeElapsed = time.Since(expungeStart)
 	}
@@ -633,25 +731,25 @@ func (w *Watcher) processRange(ctx context.Context, uidSet imap.UIDSet, dispatch
 				w.acc.Label(),
 				storeElapsed.Round(time.Millisecond),
 				expungeElapsed.Round(time.Millisecond),
-				ownedCount, len(expungePending))
+				res.ownedCount, len(expungePending))
 		} else {
 			tlog.Tracef("watcher %s: STORE only (lazy expunge): elapsed=%v owned=%d pending=%d",
 				w.acc.Label(),
 				storeElapsed.Round(time.Millisecond),
-				ownedCount, w.pendingCount)
+				res.ownedCount, w.pendingCount)
 		}
 	}
 
 	// Extend the active-poll window: we just got new data, so more is
 	// likely soon.
-	if dispatch && ownedCount > 0 {
+	if dispatch && res.ownedCount > 0 {
 		w.activeUntilNS.Store(time.Now().Add(w.cfg.ActivePollDuration()).UnixNano())
 	}
-	if skipCount > 0 {
+	if res.skipCount > 0 {
 		tlog.Debugf("watcher %s: processed %d, skipped %d (other client)",
-			w.acc.Label(), ownedCount, skipCount)
+			w.acc.Label(), res.ownedCount, res.skipCount)
 	}
-	return maxUID, nil
+	return res.maxUID, nil
 }
 
 // shouldFlushPendingExpunge returns true when the accumulated
@@ -850,93 +948,83 @@ func (w *Watcher) cleanupStartupMessagesOnSelected(c *imapclient.Client, maxUID 
 }
 
 func (w *Watcher) findOwnedUIDs(c *imapclient.Client, uidSet imap.UIDSet) (imap.UIDSet, int, int, error) {
-	fetchOpts := &imap.FetchOptions{
-		UID:         true,
-		BodySection: []*imap.FetchItemBodySection{{Peek: true}},
+	var (
+		res processResult
+		err error
+	)
+	if w.prefetchSubjects() {
+		res, err = w.processRangeBySubject(c, uidSet, false)
+	} else {
+		res, err = w.fetchAndProcessBodies(c, uidSet, nil, false)
 	}
-	fetchCmd := c.Fetch(uidSet, fetchOpts)
-	defer fetchCmd.Close()
-
-	owned := imap.UIDSet{}
-	ownedCount := 0
-	skippedCount := 0
-	for {
-		msg := fetchCmd.Next()
-		if msg == nil {
-			break
-		}
-		buf, err := msg.Collect()
-		if err != nil {
-			tlog.Warnf("watcher %s: cleanup fetch collect failed: %v",
-				w.acc.Label(), err)
-			continue
-		}
-		if buf.UID == 0 {
-			continue
-		}
-		body := findBodySectionBytes(buf.BodySection)
-		if body == nil {
-			tlog.Warnf("watcher %s: cleanup no body section for UID %d, deleting as malformed",
-				w.acc.Label(), buf.UID)
-			owned.AddNum(buf.UID)
-			ownedCount++
-			continue
-		}
-		frames, malformed := w.decodeFrames(body, buf.UID)
-		if malformed {
-			owned.AddNum(buf.UID)
-			ownedCount++
-			continue
-		}
-		if w.Filter != nil && len(frames) > 0 && !w.Filter(frames[0]) {
-			skippedCount++
-			continue
-		}
-		owned.AddNum(buf.UID)
-		ownedCount++
+	if err != nil {
+		return res.owned, res.ownedCount, res.skipCount, err
 	}
-	if err := fetchCmd.Close(); err != nil {
-		return owned, ownedCount, skippedCount, fmt.Errorf("cleanup fetch close: %w", err)
-	}
-	return owned, ownedCount, skippedCount, nil
+	return res.owned, res.ownedCount, res.skipCount, nil
 }
 
-func (w *Watcher) decodeFrames(body []byte, uid imap.UID) ([]protocol.Frame, bool) {
+func (w *Watcher) prefetchSubjects() bool {
+	return w.cfg.SubjectClientIDEnabled() && (w.SubjectClientID != 0 || w.keys.ClientKeys() > 0)
+}
+
+func (w *Watcher) decodeFrames(body []byte, uid imap.UID, clientIDHint byte) ([]protocol.Frame, bool, bool) {
 	frameBytes, err := extractFrame(body)
 	if err != nil {
 		tlog.Warnf("watcher %s: extract frame UID %d: %v",
 			w.acc.Label(), uid, err)
-		return nil, true
+		return nil, true, false
 	}
 	// Decrypt if encryption is configured. AEAD.Decrypt is a no-op when
-	// w.aead is nil. A decrypt failure most often means the two sides have
+	// w.keys is nil. A decrypt failure most often means the two sides have
 	// mismatched encryption_passphrase config — log and treat the message as
 	// malformed.
-	frameBytes, err = w.aead.Decrypt(frameBytes)
+	var keyClientID byte
+	frameBytes, keyClientID, err = w.keys.Decrypt(frameBytes, clientIDHint)
 	if err != nil {
-		tlog.Warnf("watcher %s: decrypt frame UID %d: %v (encryption_passphrase mismatch?)",
-			w.acc.Label(), uid, err)
-		return nil, true
+		if clientIDHint != 0 {
+			tlog.Warnf("watcher %s: decrypt frame UID %d client_id_hint=%d: %v (encryption_passphrase mismatch?)",
+				w.acc.Label(), uid, clientIDHint, err)
+		} else {
+			tlog.Warnf("watcher %s: decrypt frame UID %d: %v (encryption_passphrase mismatch?)",
+				w.acc.Label(), uid, err)
+		}
+		return nil, w.Filter == nil, w.Filter != nil
 	}
 	// Decode either a single frame or a batch envelope. The two formats are
 	// distinguishable by the leading byte: a batch envelope starts with the
 	// BatchMagic sentinel (0xBA) which is not a valid frame type.
+	var frames []protocol.Frame
 	if protocol.IsBatch(frameBytes) {
-		frames, err := protocol.DecodeBatch(frameBytes)
+		frames, err = protocol.DecodeBatch(frameBytes)
 		if err != nil {
 			tlog.Warnf("watcher %s: decode batch UID %d: %v",
 				w.acc.Label(), uid, err)
-			return nil, true
+			return nil, true, false
 		}
-		return frames, false
+	} else {
+		f, err := protocol.Decode(frameBytes)
+		if err != nil {
+			tlog.Warnf("watcher %s: decode frame UID %d: %v",
+				w.acc.Label(), uid, err)
+			return nil, true, false
+		}
+		frames = []protocol.Frame{f}
 	}
-	f, err := protocol.Decode(frameBytes)
-	if err != nil {
-		tlog.Warnf("watcher %s: decode frame UID %d: %v",
-			w.acc.Label(), uid, err)
-		return nil, true
+	if keyClientID != 0 && !framesMatchClientID(frames, keyClientID) {
+		tlog.Warnf("watcher %s: frame UID %d decrypted with client key %d but carried another client ID",
+			w.acc.Label(), uid, keyClientID)
+		return nil, true, false
 	}
-	return []protocol.Frame{f}, false
+	return frames, false, false
+}
+
+func framesMatchClientID(frames []protocol.Frame, clientID byte) bool {
+	for _, f := range frames {
+		if protocol.StreamClientID(f.StreamID) != clientID {
+			return false
+		}
+	}
+	return true
 }
 
 func findBodySectionBytes(sections []imapclient.FetchBodySectionBuffer) []byte {

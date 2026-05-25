@@ -43,7 +43,7 @@ import (
 type Sender struct {
 	acc  *config.AccountConfig
 	cfg  *config.Config
-	aead *titcrypto.AEAD
+	keys *titcrypto.KeyRing
 
 	queue chan *sendReq
 	// pending holds requests drained from queue that cannot share an IMAP
@@ -88,13 +88,13 @@ type sendReq struct {
 	reply chan error
 }
 
-// NewSender constructs (but does not connect) a Sender. aead may be
+// NewSender constructs (but does not connect) a Sender. keys may be
 // nil to disable per-frame encryption.
-func NewSender(cfg *config.Config, acc *config.AccountConfig, aead *titcrypto.AEAD) *Sender {
+func NewSender(cfg *config.Config, acc *config.AccountConfig, keys *titcrypto.KeyRing) *Sender {
 	return &Sender{
 		acc:       acc,
 		cfg:       cfg,
-		aead:      aead,
+		keys:      keys,
 		queue:     make(chan *sendReq, cfg.BatchQueueSize()),
 		failDelay: cfg.ReconnectInitialDelay(),
 	}
@@ -393,15 +393,24 @@ func (s *Sender) sendBatch(reqs []*sendReq) {
 			return
 		}
 	}
-	wireBytes, err := s.aead.Encrypt(encoded)
+	clientID := batchClientID(frames[0])
+	wireBytes, err := s.keys.Encrypt(encoded, clientID)
 	if err != nil {
 		s.replyAll(reqs, fmt.Errorf("encrypt: %w", err))
 		return
 	}
-	body := buildMessage(wireBytes, time.Now(), MessageOptions{
+	body, err := buildMessage(wireBytes, time.Now(), MessageOptions{
 		Format:             s.cfg.EffectiveMessageFormat(),
 		AttachmentFilename: s.cfg.EffectiveAttachmentFilename(),
+		Subject:            s.cfg.EffectiveMessageSubject(),
+		SubjectMode:        s.cfg.EffectiveMessageSubjectMode(),
+		ClientID:           clientID,
+		SubjectClientID:    s.cfg.SubjectClientIDEnabled(),
 	})
+	if err != nil {
+		s.replyAll(reqs, fmt.Errorf("build message: %w", err))
+		return
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

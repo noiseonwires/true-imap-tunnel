@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -184,6 +185,11 @@ func main() {
 		fmt.Printf("target: %s\n", cfg.Target)
 		fmt.Printf("log_level: %s\n", level)
 		fmt.Printf("message_format: %s\n", cfg.EffectiveMessageFormat())
+		fmt.Printf("message_subject_mode: %s\n", cfg.EffectiveMessageSubjectMode())
+		if cfg.EffectiveMessageSubjectMode() == config.MessageSubjectModeFixed {
+			fmt.Printf("message_subject: %q\n", cfg.EffectiveMessageSubject())
+		}
+		fmt.Printf("subject_client_id: %t\n", cfg.SubjectClientIDEnabled())
 		fmt.Printf("client_version: %s\n", cfg.ClientVersion)
 		if diag.Disabled(cfg.StatusAddr) {
 			fmt.Printf("status_addr: disabled\n")
@@ -195,6 +201,8 @@ func main() {
 		}
 		if cfg.EncryptionPassphrase != "" {
 			fmt.Printf("encryption: AES-256-GCM (passphrase set)\n")
+		} else if len(cfg.ClientEncryptionPassphrases) > 0 {
+			fmt.Printf("encryption: AES-256-GCM (%d client key(s))\n", len(cfg.ClientEncryptionPassphrases))
 		} else {
 			fmt.Printf("encryption: disabled\n")
 		}
@@ -324,6 +332,15 @@ func loadSIP003Config() (*config.Config, error) {
 
 	reorder := optionBool(opts, "reorder", true)
 	zeroRTT := optionBool(opts, "zero_rtt_open", false)
+	var subjectClientID *bool
+	if _, ok := opts["subject_client_id"]; ok {
+		v := optionBool(opts, "subject_client_id", true)
+		subjectClientID = &v
+	}
+	clientPassphrases, err := parseClientEncryptionPassphrases(opts["client_encryption_passphrases"])
+	if err != nil {
+		return nil, err
+	}
 	_, batchDelaySet := opts["batch_delay_ms"]
 	cfg := &config.Config{
 		Mode:                    mode,
@@ -350,16 +367,20 @@ func loadSIP003Config() (*config.Config, error) {
 		LazyExpungeMaxAgeMs:     optionInt(opts, "lazy_expunge_max_age_ms", 0),
 		StartupCleanupConnection: config.StartupCleanupConnection(optionString(opts, "startup_cleanup_connection",
 			string(config.StartupCleanupConnectionFallback))),
-		PingIntervalMs:       optionInt(opts, "ping_interval_ms", 0),
-		MessageFormat:        optionString(opts, "message_format", "attachment"),
-		AttachmentFilename:   opts["attachment_filename"],
-		MultipathMode:        config.MultipathMode(optionString(opts, "multipath_mode", string(config.MultipathModeStreamAffinity))),
-		EncryptionPassphrase: opts["encryption_passphrase"],
-		PidFile:              opts["pid_file"],
-		GracefulShutdownMs:   optionInt(opts, "graceful_shutdown_ms", 0),
-		ClientID:             optionUint8(opts, "client_id", 0),
-		ClientVersion:        opts["client_version"],
-		StatusAddr:           optionString(opts, "status_addr", diag.DefaultAndroidAddr),
+		PingIntervalMs:              optionInt(opts, "ping_interval_ms", 0),
+		MessageFormat:               optionString(opts, "message_format", "attachment"),
+		AttachmentFilename:          opts["attachment_filename"],
+		MessageSubject:              opts["message_subject"],
+		MessageSubjectMode:          config.MessageSubjectMode(optionString(opts, "message_subject_mode", string(config.MessageSubjectModeFixed))),
+		SubjectClientID:             subjectClientID,
+		MultipathMode:               config.MultipathMode(optionString(opts, "multipath_mode", string(config.MultipathModeStreamAffinity))),
+		EncryptionPassphrase:        opts["encryption_passphrase"],
+		ClientEncryptionPassphrases: clientPassphrases,
+		PidFile:                     opts["pid_file"],
+		GracefulShutdownMs:          optionInt(opts, "graceful_shutdown_ms", 0),
+		ClientID:                    optionUint8(opts, "client_id", 0),
+		ClientVersion:               opts["client_version"],
+		StatusAddr:                  optionString(opts, "status_addr", diag.DefaultAndroidAddr),
 	}
 	if cfg.Mode == config.ModeClient {
 		cfg.Listen = net.JoinHostPort(localHost, localPort)
@@ -657,42 +678,46 @@ type ssURLYAMLAccount struct {
 }
 
 type ssURLYAMLConfigDoc struct {
-	Mode                     config.Mode                     `yaml:"mode"`
-	LogLevel                 string                          `yaml:"log_level,omitempty"`
-	Listen                   string                          `yaml:"listen,omitempty"`
-	Target                   string                          `yaml:"target,omitempty"`
-	ClientID                 uint8                           `yaml:"client_id,omitempty"`
-	ClientVersion            string                          `yaml:"client_version,omitempty"`
-	StatusAddr               string                          `yaml:"status_addr,omitempty"`
-	Accounts                 []ssURLYAMLAccount              `yaml:"accounts"`
-	Reorder                  *bool                           `yaml:"reorder,omitempty"`
-	MultipathMode            config.MultipathMode            `yaml:"multipath_mode,omitempty"`
-	OpenTimeoutSec           int                             `yaml:"open_timeout_sec,omitempty"`
-	DialTimeoutSec           int                             `yaml:"dial_timeout_sec,omitempty"`
-	ReconnectInitialDelayMs  int                             `yaml:"reconnect_initial_delay_ms,omitempty"`
-	ReconnectMaxDelayMs      int                             `yaml:"reconnect_max_delay_ms,omitempty"`
-	ReconnectBackoff         float64                         `yaml:"reconnect_backoff,omitempty"`
-	PollIntervalMs           int                             `yaml:"poll_interval_ms,omitempty"`
-	ActivePollIntervalMs     int                             `yaml:"active_poll_interval_ms,omitempty"`
-	ActivePollDurationMs     int                             `yaml:"active_poll_duration_ms,omitempty"`
-	LazyExpungeThreshold     int                             `yaml:"lazy_expunge_threshold,omitempty"`
-	LazyExpungeMaxAgeMs      int                             `yaml:"lazy_expunge_max_age_ms,omitempty"`
-	StartupCleanupConnection config.StartupCleanupConnection `yaml:"startup_cleanup_connection,omitempty"`
-	PingIntervalMs           int                             `yaml:"ping_interval_ms,omitempty"`
-	MessageFormat            string                          `yaml:"message_format,omitempty"`
-	AttachmentFilename       string                          `yaml:"attachment_filename,omitempty"`
-	EncryptionPassphrase     string                          `yaml:"encryption_passphrase,omitempty"`
-	DNSServers               []string                        `yaml:"dns_servers,omitempty"`
-	PidFile                  string                          `yaml:"pid_file,omitempty"`
-	GracefulShutdownMs       int                             `yaml:"graceful_shutdown_ms,omitempty"`
-	BatchDelayMs             *int                            `yaml:"batch_delay_ms,omitempty"`
-	BatchMaxFrames           int                             `yaml:"batch_max_frames,omitempty"`
-	BatchMaxKB               int                             `yaml:"batch_max_kb,omitempty"`
-	BatchQueueSize           int                             `yaml:"batch_queue_size,omitempty"`
-	AsyncDataSend            bool                            `yaml:"async_data_send,omitempty"`
-	InboundQueueSize         int                             `yaml:"inbound_queue_size,omitempty"`
-	InboundQueueWaitMs       int                             `yaml:"inbound_queue_wait_ms,omitempty"`
-	ZeroRTTOpen              *bool                           `yaml:"zero_rtt_open,omitempty"`
+	Mode                        config.Mode                     `yaml:"mode"`
+	LogLevel                    string                          `yaml:"log_level,omitempty"`
+	Listen                      string                          `yaml:"listen,omitempty"`
+	Target                      string                          `yaml:"target,omitempty"`
+	ClientID                    uint8                           `yaml:"client_id,omitempty"`
+	ClientVersion               string                          `yaml:"client_version,omitempty"`
+	StatusAddr                  string                          `yaml:"status_addr,omitempty"`
+	Accounts                    []ssURLYAMLAccount              `yaml:"accounts"`
+	Reorder                     *bool                           `yaml:"reorder,omitempty"`
+	MultipathMode               config.MultipathMode            `yaml:"multipath_mode,omitempty"`
+	OpenTimeoutSec              int                             `yaml:"open_timeout_sec,omitempty"`
+	DialTimeoutSec              int                             `yaml:"dial_timeout_sec,omitempty"`
+	ReconnectInitialDelayMs     int                             `yaml:"reconnect_initial_delay_ms,omitempty"`
+	ReconnectMaxDelayMs         int                             `yaml:"reconnect_max_delay_ms,omitempty"`
+	ReconnectBackoff            float64                         `yaml:"reconnect_backoff,omitempty"`
+	PollIntervalMs              int                             `yaml:"poll_interval_ms,omitempty"`
+	ActivePollIntervalMs        int                             `yaml:"active_poll_interval_ms,omitempty"`
+	ActivePollDurationMs        int                             `yaml:"active_poll_duration_ms,omitempty"`
+	LazyExpungeThreshold        int                             `yaml:"lazy_expunge_threshold,omitempty"`
+	LazyExpungeMaxAgeMs         int                             `yaml:"lazy_expunge_max_age_ms,omitempty"`
+	StartupCleanupConnection    config.StartupCleanupConnection `yaml:"startup_cleanup_connection,omitempty"`
+	PingIntervalMs              int                             `yaml:"ping_interval_ms,omitempty"`
+	MessageFormat               string                          `yaml:"message_format,omitempty"`
+	AttachmentFilename          string                          `yaml:"attachment_filename,omitempty"`
+	MessageSubject              string                          `yaml:"message_subject,omitempty"`
+	MessageSubjectMode          config.MessageSubjectMode       `yaml:"message_subject_mode,omitempty"`
+	SubjectClientID             *bool                           `yaml:"subject_client_id,omitempty"`
+	EncryptionPassphrase        string                          `yaml:"encryption_passphrase,omitempty"`
+	ClientEncryptionPassphrases map[byte]string                 `yaml:"client_encryption_passphrases,omitempty"`
+	DNSServers                  []string                        `yaml:"dns_servers,omitempty"`
+	PidFile                     string                          `yaml:"pid_file,omitempty"`
+	GracefulShutdownMs          int                             `yaml:"graceful_shutdown_ms,omitempty"`
+	BatchDelayMs                *int                            `yaml:"batch_delay_ms,omitempty"`
+	BatchMaxFrames              int                             `yaml:"batch_max_frames,omitempty"`
+	BatchMaxKB                  int                             `yaml:"batch_max_kb,omitempty"`
+	BatchQueueSize              int                             `yaml:"batch_queue_size,omitempty"`
+	AsyncDataSend               bool                            `yaml:"async_data_send,omitempty"`
+	InboundQueueSize            int                             `yaml:"inbound_queue_size,omitempty"`
+	InboundQueueWaitMs          int                             `yaml:"inbound_queue_wait_ms,omitempty"`
+	ZeroRTTOpen                 *bool                           `yaml:"zero_rtt_open,omitempty"`
 }
 
 func compactYAMLConfig(cfg *config.Config) ([]byte, error) {
@@ -780,7 +805,18 @@ func compactYAMLConfig(cfg *config.Config) ([]byte, error) {
 	if cfg.AttachmentFilename != "" && cfg.AttachmentFilename != "tunnel.bin" {
 		doc.AttachmentFilename = cfg.AttachmentFilename
 	}
+	if cfg.MessageSubject != "" && cfg.EffectiveMessageSubject() != config.DefaultMessageSubject {
+		doc.MessageSubject = cfg.EffectiveMessageSubject()
+	}
+	if cfg.EffectiveMessageSubjectMode() != config.MessageSubjectModeFixed {
+		doc.MessageSubjectMode = cfg.EffectiveMessageSubjectMode()
+	}
+	if cfg.SubjectClientID != nil && !cfg.SubjectClientIDEnabled() {
+		v := false
+		doc.SubjectClientID = &v
+	}
 	doc.EncryptionPassphrase = cfg.EncryptionPassphrase
+	doc.ClientEncryptionPassphrases = cfg.ClientEncryptionPassphrases
 	doc.DNSServers = cfg.DNSServers
 	doc.PidFile = cfg.PidFile
 	if cfg.GracefulShutdownMs != 0 && cfg.GracefulShutdownMs != 3000 {
@@ -886,7 +922,13 @@ func ssURLQueryOptions(cfg *config.Config, skipDefaults bool) (string, error) {
 	addInt("ping_interval_ms", cfg.PingIntervalMs, 0)
 	addString("message_format", cfg.EffectiveMessageFormat(), "attachment")
 	addString("attachment_filename", cfg.AttachmentFilename, "tunnel.bin")
+	addString("message_subject", cfg.MessageSubject, config.DefaultMessageSubject)
+	addString("message_subject_mode", string(cfg.EffectiveMessageSubjectMode()), string(config.MessageSubjectModeFixed))
+	if !skipDefaults || !cfg.SubjectClientIDEnabled() {
+		addBool("subject_client_id", cfg.SubjectClientIDEnabled(), true)
+	}
 	addString("encryption_passphrase", cfg.EncryptionPassphrase, "")
+	addString("client_encryption_passphrases", formatClientEncryptionPassphrases(cfg.ClientEncryptionPassphrases), "")
 	if len(cfg.DNSServers) == 1 {
 		add("dns_server", cfg.DNSServers[0])
 	} else if len(cfg.DNSServers) > 1 {
@@ -1068,6 +1110,45 @@ func optionBool(opts map[string]string, key string, def bool) bool {
 		}
 	}
 	return def
+}
+
+func parseClientEncryptionPassphrases(raw string) (map[byte]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	result := map[byte]string{}
+	for _, part := range strings.Split(raw, ",") {
+		idText, passphrase, ok := strings.Cut(strings.TrimSpace(part), ":")
+		if !ok {
+			return nil, fmt.Errorf("invalid client_encryption_passphrases entry %q (expected id:passphrase)", part)
+		}
+		id, err := strconv.Atoi(strings.TrimSpace(idText))
+		if err != nil || id <= 0 || id > 255 {
+			return nil, fmt.Errorf("invalid client_encryption_passphrases client ID %q (expected 1-255)", idText)
+		}
+		if strings.TrimSpace(passphrase) == "" {
+			return nil, fmt.Errorf("invalid client_encryption_passphrases[%d]: passphrase must not be empty", id)
+		}
+		result[byte(id)] = passphrase
+	}
+	return result, nil
+}
+
+func formatClientEncryptionPassphrases(passphrases map[byte]string) string {
+	if len(passphrases) == 0 {
+		return ""
+	}
+	ids := make([]int, 0, len(passphrases))
+	for id := range passphrases {
+		ids = append(ids, int(id))
+	}
+	sort.Ints(ids)
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, fmt.Sprintf("%d:%s", id, passphrases[byte(id)]))
+	}
+	return strings.Join(parts, ",")
 }
 
 type dnsLookupFunc func(context.Context, string) ([]string, error)
