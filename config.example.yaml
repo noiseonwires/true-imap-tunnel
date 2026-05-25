@@ -125,6 +125,14 @@ accounts:
 # leave on even with a single account.
 reorder: true
 
+# Multipath account selection for DATA frames:
+#   stream_affinity    keeps each TCP stream on one account (default, safest)
+#   frame_round_robin  may spread one stream's DATA frames across proven paths
+#                      for more bandwidth, but is experimental and can overflow
+#                      the reorder buffer/reset connections when account latency
+#                      or server performance differs; prefer stream_affinity
+multipath_mode: stream_affinity
+
 # How long the client waits for OPEN_OK after sending OPEN.
 open_timeout_sec: 30
 
@@ -137,9 +145,10 @@ reconnect_max_delay_ms: 30000
 reconnect_backoff: 1.5
 
 # Polling fallback for IMAP servers that don't advertise IDLE (RFC 2177)
-# — notably seznam.cz. With FETCH directly issued on each cycle, there's
-# no separate NOOP; the cycle simply runs FETCH lastUID+1:* and reacts
-# to whatever is there. Ignored when the server does support IDLE.
+# — notably seznam.cz. The fallback cycle sends NOOP to refresh selected
+# mailbox state, then runs FETCH lastUID+1:* and reacts to whatever is there.
+# Set disable_idle=true to force this polling mode even when the server
+# advertises IDLE, which is useful for testing or for buggy IDLE providers.
 #
 # The watcher uses two intervals:
 #   - poll_interval_ms (idle):    used when nothing is going on
@@ -147,6 +156,7 @@ reconnect_backoff: 1.5
 #                                 something, or right after the previous
 #                                 poll returned new frames
 # Active mode lasts for active_poll_duration_ms after the last activity.
+disable_idle: false
 poll_interval_ms: 3000
 active_poll_interval_ms: 100
 active_poll_duration_ms: 5000
@@ -161,6 +171,15 @@ active_poll_duration_ms: 5000
 # Set lazy_expunge_threshold: 1 to restore eager per-cycle EXPUNGE.
 lazy_expunge_threshold: 16
 lazy_expunge_max_age_ms: 30000
+
+# Startup stale-message cleanup. By default cleanup first tries a short-lived
+# dedicated IMAP connection so a large stale folder does not block receive
+# readiness, then retries on the watcher connection if the extra connection
+# fails. Use "main" for IMAP servers/accounts that reject even attempted
+# concurrent connections.
+#
+# Values: dedicated, main, fallback
+startup_cleanup_connection: fallback
 
 # End-to-end RTT probe (client mode only).
 #
@@ -182,6 +201,11 @@ lazy_expunge_max_age_ms: 30000
 # Ignored in server mode.
 ping_interval_ms: 0
 
+# Optional local diagnostics HTTP API for status/log viewers.
+# Empty = disabled for normal YAML configs. SIP003/Android defaults to
+# "127.123.45.67:17680"; set "off" to disable that default.
+# status_addr: "127.123.45.67:17680"
+
 # Frame-level encryption. When set, every frame is encrypted with
 # AES-256-GCM before being base64-encoded into the IMAP message body.
 # Both sides MUST use the same passphrase or every received frame
@@ -196,6 +220,11 @@ ping_interval_ms: 0
 #
 # Empty = disabled (default).
 # encryption_passphrase: "correct horse battery staple"
+
+# Optional PID file. When set, startup removes a stale still-running tunnel
+# process recorded in this file before binding the listen port, then deletes
+# the file on clean exit.
+# pid_file: "true-imap-tunnel.pid"
 
 # Optional DNS override for resolving IMAP hosts (and the server-mode
 # target when it is a hostname). If unset, the local/system resolver is
@@ -269,6 +298,11 @@ async_data_send: true
 # typical frames; comfortably larger than any transient TCP
 # backpressure on a healthy network.
 inbound_queue_size: 64
+
+# How long an overflowed per-stream inbound queue waits for TCP-write space
+# before resetting that stream. Default 30000 ms. Set below 0 to reset
+# immediately instead of waiting.
+inbound_queue_wait_ms: 30000
 
 # How the IMAP message body carrying each frame is structured. Both modes
 # encode the frame in base64; the difference is purely in how the message

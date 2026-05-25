@@ -11,16 +11,20 @@ import (
 	"log"
 	"net"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	imap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
 
 	"github.com/true-imap-tunnel/true-imap-tunnel/internal/config"
+	"github.com/true-imap-tunnel/true-imap-tunnel/internal/protocol"
 	"github.com/true-imap-tunnel/true-imap-tunnel/internal/tlog"
 )
 
@@ -108,6 +112,47 @@ func startEchoServer(t *testing.T) string {
 				defer c.Close()
 				_, _ = io.Copy(c, c)
 			}(c)
+		}
+	}()
+	t.Cleanup(func() { _ = ln.Close() })
+	return ln.Addr().String()
+}
+
+// startDelayedTCPProxy returns a local TCP address that proxies to target after
+// delaying each accepted connection. It is used to model a slower IMAP provider
+// that connects after the first path has already become ready.
+func startDelayedTCPProxy(t *testing.T, target string, delay time.Duration) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen proxy: %v", err)
+	}
+	go func() {
+		for {
+			downstream, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer downstream.Close()
+				time.Sleep(delay)
+				upstream, err := net.Dial("tcp", target)
+				if err != nil {
+					return
+				}
+				defer upstream.Close()
+
+				done := make(chan struct{}, 2)
+				go func() {
+					_, _ = io.Copy(upstream, downstream)
+					done <- struct{}{}
+				}()
+				go func() {
+					_, _ = io.Copy(downstream, upstream)
+					done <- struct{}{}
+				}()
+				<-done
+			}()
 		}
 	}()
 	t.Cleanup(func() { _ = ln.Close() })
@@ -369,6 +414,137 @@ func mustNew(t *testing.T, cfg *config.Config) *Tunnel {
 	return tt
 }
 
+func receiveReadyCount(m *Multipath) int {
+	n := 0
+	for _, w := range m.watchers {
+		if w.ReceiveReady() {
+			n++
+		}
+	}
+	return n
+}
+
+func waitForAllPathsReady(t *testing.T, timeout time.Duration, tunnels ...*Tunnel) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		ready := true
+		for _, tn := range tunnels {
+			paths := tn.Paths()
+			if paths.ConnectedCount() != paths.SenderCount() ||
+				receiveReadyCount(paths) != paths.SenderCount() {
+				ready = false
+				break
+			}
+		}
+		if ready {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	for _, tn := range tunnels {
+		paths := tn.Paths()
+		t.Logf("paths not ready: connected=%d/%d receive_ready=%d/%d",
+			paths.ConnectedCount(), paths.SenderCount(),
+			receiveReadyCount(paths), paths.SenderCount())
+	}
+	t.Fatalf("timed out waiting for all paths to become ready")
+}
+
+func waitForStreamsIdleStable(t *testing.T, timeout time.Duration, tunnels ...*Tunnel) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var idleSince time.Time
+	for time.Now().Before(deadline) {
+		allIdle := true
+		for _, tn := range tunnels {
+			if tn.streams.Count() != 0 {
+				allIdle = false
+				break
+			}
+		}
+		if allIdle {
+			if idleSince.IsZero() {
+				idleSince = time.Now()
+			}
+			if time.Since(idleSince) >= 200*time.Millisecond {
+				return
+			}
+		} else {
+			idleSince = time.Time{}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	for _, tn := range tunnels {
+		t.Logf("streams still active: %d", tn.streams.Count())
+	}
+	t.Fatalf("timed out waiting for streams to become idle")
+}
+
+func sendPingProbes(t *testing.T, tn *Tunnel) {
+	t.Helper()
+	for i := 0; i < tn.Paths().SenderCount(); i++ {
+		if err := tn.Paths().SendVia(i, protocol.Frame{
+			Type:     protocol.MsgPing,
+			StreamID: tn.pingStreamID(),
+			Payload:  buildPingPayload(time.Now(), tn.cfg.ClientVersion),
+		}); err != nil {
+			t.Fatalf("send ping via account %d: %v", i, err)
+		}
+	}
+}
+
+func idleKnown(m *Multipath, idx int, want bool) bool {
+	if idx < 0 || idx >= len(m.watchers) {
+		return false
+	}
+	idle, known := m.watchers[idx].IdleSupported()
+	return known && idle == want
+}
+
+func waitForIdleKnown(t *testing.T, timeout time.Duration, tunnels ...*Tunnel) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		ready := true
+		for _, tn := range tunnels {
+			paths := tn.Paths()
+			if paths.ProvenCount() != paths.SenderCount() {
+				ready = false
+				break
+			}
+			for i := 0; i < paths.SenderCount(); i++ {
+				if !idleKnown(paths, i, true) {
+					ready = false
+					break
+				}
+			}
+		}
+		if ready {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	for _, tn := range tunnels {
+		t.Logf("idle proof not ready: proven=%d/%d", tn.Paths().ProvenCount(), tn.Paths().SenderCount())
+	}
+	t.Fatalf("timed out waiting for all paths to be proven with known IDLE support")
+}
+
+func forceIdleSupported(t *testing.T, m *Multipath, idx int, idle bool) {
+	t.Helper()
+	if idx < 0 || idx >= len(m.watchers) {
+		t.Fatalf("watcher index %d out of range", idx)
+	}
+	v := reflect.ValueOf(m.watchers[idx]).Elem().FieldByName("idleSupported")
+	ptr := (*atomic.Int32)(unsafe.Pointer(v.UnsafeAddr()))
+	if idle {
+		ptr.Store(1)
+	} else {
+		ptr.Store(0)
+	}
+}
+
 // TestEndToEnd_Multipath exercises two independent IMAP "accounts" (two
 // distinct users on the same in-memory server). Outbound frames are
 // round-robined; inbound watched in parallel.
@@ -530,6 +706,162 @@ func TestEndToEnd_FrameRoundRobinSingleStream(t *testing.T) {
 	}
 	if serverDelta0 == 0 || serverDelta1 == 0 {
 		t.Fatalf("server DATA was not spread across accounts: before=%v after=%v",
+			serverBefore, serverAfter)
+	}
+
+	cancel()
+	wg.Wait()
+}
+
+func TestEndToEnd_StartupPingProbesLateConnectedAccount(t *testing.T) {
+	t.Parallel()
+
+	imapAddr := startMemIMAP(t)
+	delayedAddr := startDelayedTCPProxy(t, imapAddr, 2500*time.Millisecond)
+	echoAddr := startEchoServer(t)
+	clientListen := freePort(t)
+
+	rt := true
+	clientCfg := &config.Config{
+		Mode:   config.ModeClient,
+		Listen: clientListen,
+		Accounts: []config.AccountConfig{
+			makeAccountUser(imapAddr, "tit", "tit-pass", "Tunnel.C2S", "Tunnel.S2C"),
+			makeAccountUser(delayedAddr, "tit2", "tit-pass2", "Tunnel.C2S", "Tunnel.S2C"),
+		},
+		Reorder: &rt,
+	}
+	serverCfg := &config.Config{
+		Mode:   config.ModeServer,
+		Target: echoAddr,
+		Accounts: []config.AccountConfig{
+			makeAccountUser(imapAddr, "tit", "tit-pass", "Tunnel.S2C", "Tunnel.C2S"),
+			makeAccountUser(delayedAddr, "tit2", "tit-pass2", "Tunnel.S2C", "Tunnel.C2S"),
+		},
+		Reorder: &rt,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	server := mustNew(t, serverCfg)
+	client := mustNew(t, clientCfg)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = server.Run(ctx) }()
+	go func() { defer wg.Done(); _ = client.Run(ctx) }()
+
+	waitForListen(t, clientListen, 10*time.Second, client, server)
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if client.Paths().ProvenCount() == 2 && server.Paths().ProvenCount() == 2 {
+			cancel()
+			wg.Wait()
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("late connected path was not proven: client=%d/%d server=%d/%d client_sent=%v server_sent=%v",
+		client.Paths().ProvenCount(), client.Paths().SenderCount(),
+		server.Paths().ProvenCount(), server.Paths().SenderCount(),
+		client.Paths().SenderSentCounts(), server.Paths().SenderSentCounts())
+}
+
+func TestEndToEnd_FrameRoundRobinPrefersIdleCapablePaths(t *testing.T) {
+	imapAddr := startMemIMAP(t)
+	echoAddr := startEchoServer(t)
+	clientListen := freePort(t)
+
+	rt := true
+	mode := config.MultipathModeFrameRoundRobin
+	clientCfg := &config.Config{
+		Mode:   config.ModeClient,
+		Listen: clientListen,
+		Accounts: []config.AccountConfig{
+			makeAccountUser(imapAddr, "tit", "tit-pass", "Tunnel.C2S", "Tunnel.S2C"),
+			makeAccountUser(imapAddr, "tit2", "tit-pass2", "Tunnel.C2S", "Tunnel.S2C"),
+		},
+		Reorder:               &rt,
+		MultipathMode:         mode,
+		PingIntervalMs:        -1,
+		PollIntervalMs:        100,
+		ActivePollIntervalMs:  50,
+		ActivePollDurationMs:  500,
+		LazyExpungeThreshold_: 1,
+		LazyExpungeMaxAgeMs:   100,
+	}
+	serverCfg := &config.Config{
+		Mode:   config.ModeServer,
+		Target: echoAddr,
+		Accounts: []config.AccountConfig{
+			makeAccountUser(imapAddr, "tit", "tit-pass", "Tunnel.S2C", "Tunnel.C2S"),
+			makeAccountUser(imapAddr, "tit2", "tit-pass2", "Tunnel.S2C", "Tunnel.C2S"),
+		},
+		Reorder:               &rt,
+		MultipathMode:         mode,
+		PingIntervalMs:        -1,
+		PollIntervalMs:        100,
+		ActivePollIntervalMs:  50,
+		ActivePollDurationMs:  500,
+		LazyExpungeThreshold_: 1,
+		LazyExpungeMaxAgeMs:   100,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	server := mustNew(t, serverCfg)
+	client := mustNew(t, clientCfg)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = server.Run(ctx) }()
+	go func() { defer wg.Done(); _ = client.Run(ctx) }()
+
+	waitForListen(t, clientListen, 10*time.Second, client, server)
+	waitForAllPathsReady(t, 10*time.Second, client, server)
+	sendPingProbes(t, client)
+	waitForIdleKnown(t, 15*time.Second, client, server)
+	waitForStreamsIdleStable(t, 5*time.Second, client, server)
+	forceIdleSupported(t, client.Paths(), 0, false)
+	forceIdleSupported(t, server.Paths(), 0, false)
+
+	clientBefore := client.Paths().SenderSentCounts()
+	serverBefore := server.Paths().SenderSentCounts()
+
+	conn, err := net.Dial("tcp", clientListen)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	payload := []byte(strings.Repeat("idle-preference-payload-", 16000))
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buf := make([]byte, len(payload))
+	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(buf) != string(payload) {
+		t.Fatalf("mismatch")
+	}
+
+	clientAfter := client.Paths().SenderSentCounts()
+	serverAfter := server.Paths().SenderSentCounts()
+	clientDelta0 := clientAfter[0] - clientBefore[0]
+	clientDelta1 := clientAfter[1] - clientBefore[1]
+	serverDelta0 := serverAfter[0] - serverBefore[0]
+	serverDelta1 := serverAfter[1] - serverBefore[1]
+	if clientDelta0 != 0 || clientDelta1 == 0 {
+		t.Fatalf("client traffic was not confined to IDLE-capable account: before=%v after=%v",
+			clientBefore, clientAfter)
+	}
+	if serverDelta0 != 0 || serverDelta1 == 0 {
+		t.Fatalf("server traffic was not confined to IDLE-capable account: before=%v after=%v",
 			serverBefore, serverAfter)
 	}
 

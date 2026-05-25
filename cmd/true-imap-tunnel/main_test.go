@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/true-imap-tunnel/true-imap-tunnel/internal/config"
+	"github.com/true-imap-tunnel/true-imap-tunnel/internal/diag"
 )
 
 func TestParsePluginOptionsEscapes(t *testing.T) {
@@ -78,6 +79,9 @@ func TestLoadSIP003ConfigClient(t *testing.T) {
 	}
 	if cfg.ClientVersion != "test-build" {
 		t.Fatalf("client_version = %q", cfg.ClientVersion)
+	}
+	if cfg.StatusAddr != diag.DefaultAndroidAddr {
+		t.Fatalf("status_addr = %q, want %q", cfg.StatusAddr, diag.DefaultAndroidAddr)
 	}
 	if len(cfg.Accounts) != 1 || cfg.Accounts[0].FolderSend != "c2s" {
 		t.Fatalf("account = %+v", cfg.Accounts)

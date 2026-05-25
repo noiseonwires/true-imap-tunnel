@@ -36,6 +36,23 @@ const (
 	MultipathModeFrameRoundRobin MultipathMode = "frame_round_robin"
 )
 
+// StartupCleanupConnection controls which IMAP connection removes stale
+// pre-startup messages.
+type StartupCleanupConnection string
+
+const (
+	// StartupCleanupConnectionDedicated uses a short-lived extra IMAP
+	// connection so stale-folder cleanup cannot delay the hot receive loop.
+	StartupCleanupConnectionDedicated StartupCleanupConnection = "dedicated"
+	// StartupCleanupConnectionMain runs cleanup on the watcher connection.
+	// This is useful for IMAP servers/accounts that reject concurrent sessions.
+	StartupCleanupConnectionMain StartupCleanupConnection = "main"
+	// StartupCleanupConnectionFallback tries the dedicated connection first,
+	// then retries cleanup on the watcher connection if the extra connection
+	// fails.
+	StartupCleanupConnectionFallback StartupCleanupConnection = "fallback"
+)
+
 // AccountConfig is a single IMAP account participating in the tunnel.
 //
 // Each account contributes one independent transport path. Configuring
@@ -129,6 +146,10 @@ type Config struct {
 	// build metadata; YAML can override it for custom wrappers.
 	ClientVersion string `yaml:"client_version"`
 
+	// StatusAddr enables the local diagnostics HTTP API when non-empty.
+	// Use "off" to disable it in environments that set a default.
+	StatusAddr string `yaml:"status_addr"`
+
 	// Accounts: at least one required.
 	Accounts []AccountConfig `yaml:"accounts"`
 
@@ -164,15 +185,20 @@ type Config struct {
 	ReconnectBackoff        float64 `yaml:"reconnect_backoff"`
 
 	// PollIntervalMs is the polling interval (in milliseconds) used when
-	// the IMAP server does not advertise the IDLE capability. It is also
-	// the maximum IDLE wait before a safety FETCH, so missed EXISTS
-	// notifications cannot stall the tunnel indefinitely. Default 3000
-	// (3s).
+	// the IMAP server does not advertise the IDLE capability, or when
+	// DisableIdle is set. It is also the maximum IDLE wait before a safety
+	// FETCH, so missed EXISTS notifications cannot stall the tunnel
+	// indefinitely. Default 3000 (3s).
 	//
 	// Treated as the *idle* poll interval — used when there's no recent
 	// traffic. While traffic is flowing or expected, the watcher polls
 	// at ActivePollIntervalMs (see below) for low end-to-end latency.
 	PollIntervalMs int `yaml:"poll_interval_ms"`
+
+	// DisableIdle forces NOOP+FETCH polling even when the IMAP server
+	// advertises IDLE/IMAP4rev2. Useful for providers with broken or
+	// unreliable IDLE support, and for comparing polling behavior.
+	DisableIdle bool `yaml:"disable_idle"`
 
 	// ActivePollIntervalMs is the polling interval used during active
 	// conversations: after a watcher returned new frames, or after this
@@ -199,6 +225,16 @@ type Config struct {
 	// Prevents tail latency from leaving stale rows in the mailbox
 	// during light-traffic periods. Default 30000 (30s).
 	LazyExpungeMaxAgeMs int `yaml:"lazy_expunge_max_age_ms"`
+
+	// StartupCleanupConnection controls how old messages that existed in
+	// FolderRecv before watcher startup are removed:
+	//   "dedicated": cleanup uses a short-lived extra connection,
+	//     so startup traffic is not blocked by a large stale folder.
+	//   "main": cleanup uses the watcher connection, for IMAP servers that
+	//     reject multiple simultaneous connections for the same account.
+	//   "fallback" (default): try "dedicated" first and retry on "main" if
+	//     that fails.
+	StartupCleanupConnection StartupCleanupConnection `yaml:"startup_cleanup_connection"`
 
 	// PingIntervalMs controls the end-to-end RTT probe in client mode.
 	//
@@ -410,6 +446,24 @@ func (c *Config) EffectiveMultipathMode() MultipathMode {
 // independently of their stream's preferred account.
 func (c *Config) FrameRoundRobinEnabled() bool {
 	return c.EffectiveMultipathMode() == MultipathModeFrameRoundRobin
+}
+
+// EffectiveStartupCleanupConnection returns the startup stale-message cleanup
+// connection mode. The default keeps the low-latency dedicated path and retries
+// on the watcher connection when a server rejects the extra connection.
+func (c *Config) EffectiveStartupCleanupConnection() StartupCleanupConnection {
+	switch StartupCleanupConnection(strings.ToLower(strings.TrimSpace(string(c.StartupCleanupConnection)))) {
+	case "":
+		return StartupCleanupConnectionFallback
+	case StartupCleanupConnectionDedicated:
+		return StartupCleanupConnectionDedicated
+	case StartupCleanupConnectionMain:
+		return StartupCleanupConnectionMain
+	case StartupCleanupConnectionFallback:
+		return StartupCleanupConnectionFallback
+	default:
+		return c.StartupCleanupConnection
+	}
 }
 
 // OpenTimeout returns the OPEN response timeout.
@@ -716,6 +770,11 @@ func (c *Config) Validate() error {
 	case MultipathModeStreamAffinity, MultipathModeFrameRoundRobin:
 	default:
 		return fmt.Errorf("invalid multipath_mode %q (expected \"stream_affinity\" or \"frame_round_robin\")", c.MultipathMode)
+	}
+	switch c.EffectiveStartupCleanupConnection() {
+	case StartupCleanupConnectionDedicated, StartupCleanupConnectionMain, StartupCleanupConnectionFallback:
+	default:
+		return fmt.Errorf("invalid startup_cleanup_connection %q (expected \"dedicated\", \"main\" or \"fallback\")", c.StartupCleanupConnection)
 	}
 	return nil
 }

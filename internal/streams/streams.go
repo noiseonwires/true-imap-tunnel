@@ -140,11 +140,20 @@ type Manager struct {
 	// multipath route table).
 	OnRemove func(streamID uint32)
 
+	// OnReorderReset, if set, is invoked when the reorder buffer gives
+	// up on a missing SeqID and resets the stream locally. Upper layers
+	// use this to notify the peer with a real RST so it stops sending.
+	OnReorderReset func(streamID uint32)
+
 	// Per-stream send sequence counters (auto-incremented in SendFrame).
 	seqCounters sync.Map // streamID → *atomic.Uint32
 
 	reorderMu   sync.Mutex
 	reorderBufs map[uint32]*reorderBuf
+	// closedReorder tombstones recently-closed stream IDs so late DATA/FIN
+	// frames from already-aborted streams are dropped instead of creating
+	// fresh reorder buffers that wait forever for SeqID 1.
+	closedReorder map[uint32]time.Time
 	// lastReorderSweep is the time of the last orphan-buffer GC sweep.
 	// Guarded by reorderMu. The sweep runs lazily from DispatchFrame at
 	// most once per MaxReorderDelay, deleting buffers whose stream is
@@ -174,6 +183,7 @@ func NewManager(send SendFunc) *Manager {
 		streams:           make(map[uint32]*Stream),
 		send:              send,
 		reorderBufs:       make(map[uint32]*reorderBuf),
+		closedReorder:     make(map[uint32]time.Time),
 		InboundQueueSize:  64,
 		OutboundQueueWait: 30 * time.Second,
 		MaxReorderPending: 1024,
@@ -270,6 +280,10 @@ func (m *Manager) Remove(id uint32) {
 	if m.Reorder {
 		m.reorderMu.Lock()
 		delete(m.reorderBufs, id)
+		if m.closedReorder == nil {
+			m.closedReorder = make(map[uint32]time.Time)
+		}
+		m.closedReorder[id] = time.Now().Add(m.reorderTombstoneDuration())
 		m.reorderMu.Unlock()
 	}
 	m.mu.Lock()
@@ -526,6 +540,31 @@ func (m *Manager) Count() int {
 	return len(m.streams)
 }
 
+func (m *Manager) reorderDelay() time.Duration {
+	if m.MaxReorderDelay <= 0 {
+		return 30 * time.Second
+	}
+	return m.MaxReorderDelay
+}
+
+func (m *Manager) reorderTombstoneDuration() time.Duration {
+	d := 4 * m.reorderDelay()
+	if d < 30*time.Second {
+		return 30 * time.Second
+	}
+	return d
+}
+
+func (m *Manager) tombstoneReorderStream(streamID uint32, now time.Time) {
+	m.reorderMu.Lock()
+	delete(m.reorderBufs, streamID)
+	if m.closedReorder == nil {
+		m.closedReorder = make(map[uint32]time.Time)
+	}
+	m.closedReorder[streamID] = now.Add(m.reorderTombstoneDuration())
+	m.reorderMu.Unlock()
+}
+
 // sweepOrphanReorderBufsLocked drops reorderBuf entries whose stream
 // is not registered and whose lastSeen is older than idleBudget.
 //
@@ -538,6 +577,11 @@ func (m *Manager) Count() int {
 // MaxReorderDelay, so the cost is amortised across many DispatchFrame
 // calls.
 func (m *Manager) sweepOrphanReorderBufsLocked(now time.Time, idleBudget time.Duration) {
+	for id, until := range m.closedReorder {
+		if now.After(until) {
+			delete(m.closedReorder, id)
+		}
+	}
 	if len(m.reorderBufs) == 0 {
 		return
 	}
@@ -595,7 +639,17 @@ func (m *Manager) DispatchFrame(f protocol.Frame, handler func(protocol.Frame)) 
 	}
 
 	now := time.Now()
+	maxDelay := m.reorderDelay()
 	m.reorderMu.Lock()
+	if f.Type == protocol.MsgOpen && f.SeqID == 1 {
+		delete(m.closedReorder, f.StreamID)
+	} else if until, ok := m.closedReorder[f.StreamID]; ok {
+		if now.Before(until) {
+			m.reorderMu.Unlock()
+			return
+		}
+		delete(m.closedReorder, f.StreamID)
+	}
 	rb, ok := m.reorderBufs[f.StreamID]
 	if !ok {
 		rb = &reorderBuf{expected: 1, pending: make(map[uint32]protocol.Frame), lastSeen: now}
@@ -606,10 +660,6 @@ func (m *Manager) DispatchFrame(f protocol.Frame, handler func(protocol.Frame)) 
 	// idle past the reorder-delay budget. Without this, frames for
 	// stream-IDs that never receive an OPEN (and thus never trigger
 	// CloseStream→Remove) would leak reorderBuf entries indefinitely.
-	maxDelay := m.MaxReorderDelay
-	if maxDelay <= 0 {
-		maxDelay = 30 * time.Second
-	}
 	if now.Sub(m.lastReorderSweep) > maxDelay {
 		m.lastReorderSweep = now
 		m.sweepOrphanReorderBufsLocked(now, maxDelay)
@@ -620,7 +670,6 @@ func (m *Manager) DispatchFrame(f protocol.Frame, handler func(protocol.Frame)) 
 	var reset bool
 
 	rb.mu.Lock()
-	defer rb.mu.Unlock()
 
 	rb.lastSeen = now
 
@@ -694,12 +743,18 @@ func (m *Manager) DispatchFrame(f protocol.Frame, handler func(protocol.Frame)) 
 			f.StreamID, f.SeqID, rb.expected)
 	}
 	if reset {
+		rb.mu.Unlock()
+		m.tombstoneReorderStream(f.StreamID, now)
+		if m.OnReorderReset != nil {
+			m.OnReorderReset(f.StreamID)
+		}
 		handler(protocol.Frame{Type: protocol.MsgRst, StreamID: f.StreamID})
 		return
 	}
 	for _, df := range deliver {
 		handler(df)
 	}
+	rb.mu.Unlock()
 }
 
 // ReadLoop reads from the stream's TCP connection and sends DATA frames to

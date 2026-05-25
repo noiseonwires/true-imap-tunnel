@@ -2,6 +2,7 @@ package imap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -57,7 +58,11 @@ type Sender struct {
 	sentCount  atomic.Uint64
 	batchCount atomic.Uint64
 
-	connected atomic.Bool
+	connected     atomic.Bool
+	connects      atomic.Uint64
+	connectedAtNS atomic.Int64
+
+	canceled sync.Map // streamID -> time.Time deadline for dropping stale DATA/FIN
 
 	// AsyncErrorHandler is invoked for async DATA requests when their
 	// eventual APPEND fails. It lets upper layers reset the affected
@@ -71,7 +76,11 @@ type Sender struct {
 const (
 	appendMaxAttempts = 3
 	appendRetryDelay  = 250 * time.Millisecond
+
+	streamCancelTTL = 2 * time.Minute
 )
+
+var errStreamCanceled = errors.New("stream canceled")
 
 // sendReq is a queued APPEND request from a caller of Send.
 type sendReq struct {
@@ -96,6 +105,18 @@ func (s *Sender) Label() string { return s.acc.Label() }
 
 // Connected reports whether the sender currently holds an open connection.
 func (s *Sender) Connected() bool { return s.connected.Load() }
+
+// ConnectedAt returns the time of the most recent successful connection.
+func (s *Sender) ConnectedAt() time.Time {
+	ns := s.connectedAtNS.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// ConnectCount returns the number of successful IMAP connections.
+func (s *Sender) ConnectCount() uint64 { return s.connects.Load() }
 
 // SentCount returns the total number of successful frame APPENDs since
 // startup. A batch of N frames counts as N (not 1) — this is the
@@ -127,6 +148,24 @@ func (s *Sender) Enqueue(f protocol.Frame) error {
 	return nil
 }
 
+// CancelStream marks a stream closed so queued async DATA/FIN for it are
+// discarded before APPEND. RST is still allowed through so peer notification is
+// not suppressed.
+func (s *Sender) CancelStream(streamID uint32) {
+	if streamID == 0 {
+		return
+	}
+	s.canceled.Store(streamID, time.Now().Add(streamCancelTTL))
+}
+
+// AllowStream clears a cancellation tombstone for a fresh stream lifecycle.
+func (s *Sender) AllowStream(streamID uint32) {
+	if streamID == 0 {
+		return
+	}
+	s.canceled.Delete(streamID)
+}
+
 // connect ensures s.client is established. Caller must hold s.mu.
 func (s *Sender) connect() error {
 	if s.client != nil {
@@ -155,6 +194,8 @@ func (s *Sender) connect() error {
 
 	s.client = c
 	s.connected.Store(true)
+	s.connects.Add(1)
+	s.connectedAtNS.Store(time.Now().UnixNano())
 	s.failDelay = s.cfg.ReconnectInitialDelay()
 	tlog.Infof("sender %s: connected to %s", s.acc.Label(), s.acc.Host)
 	return nil
@@ -251,6 +292,9 @@ func (s *Sender) Run(ctx context.Context) {
 			}
 		}
 
+		if s.dropIfCanceled(first) {
+			continue
+		}
 		batch := []*sendReq{first}
 		// If a batch delay is configured and no other frames are
 		// already queued, pause briefly to let near-simultaneous
@@ -290,6 +334,10 @@ func (s *Sender) opportunisticDrain(batch []*sendReq) []*sendReq {
 	}
 	for len(batch) < maxFrames && totalBytes < maxBytes && len(s.pending) > 0 {
 		r := s.pending[0]
+		if s.dropIfCanceled(r) {
+			s.pending = s.pending[1:]
+			continue
+		}
 		if batchClientID(r.frame) != clientID {
 			break
 		}
@@ -300,6 +348,9 @@ func (s *Sender) opportunisticDrain(batch []*sendReq) []*sendReq {
 	for len(batch) < maxFrames && totalBytes < maxBytes {
 		select {
 		case r := <-s.queue:
+			if s.dropIfCanceled(r) {
+				continue
+			}
 			if batchClientID(r.frame) != clientID {
 				s.pending = append(s.pending, r)
 				continue
@@ -322,6 +373,10 @@ func batchClientID(f protocol.Frame) byte {
 // because a dropped mobile/TLS/IMAP connection can make the final status
 // ambiguous; duplicate frames are safer than silently losing DATA.
 func (s *Sender) sendBatch(reqs []*sendReq) {
+	reqs = s.filterCanceled(reqs)
+	if len(reqs) == 0 {
+		return
+	}
 	frames := make([]protocol.Frame, len(reqs))
 	for i, r := range reqs {
 		frames[i] = r.frame
@@ -374,6 +429,45 @@ func (s *Sender) sendBatch(reqs []*sendReq) {
 	}
 
 	s.replyAll(reqs, nil)
+}
+
+func (s *Sender) filterCanceled(reqs []*sendReq) []*sendReq {
+	out := reqs[:0]
+	for _, r := range reqs {
+		if s.dropIfCanceled(r) {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func (s *Sender) dropIfCanceled(r *sendReq) bool {
+	if r == nil || !dropAfterCancel(r.frame.Type) || r.frame.StreamID == 0 {
+		return false
+	}
+	v, ok := s.canceled.Load(r.frame.StreamID)
+	if !ok {
+		return false
+	}
+	until, ok := v.(time.Time)
+	if !ok || time.Now().After(until) {
+		s.canceled.Delete(r.frame.StreamID)
+		return false
+	}
+	if r.reply != nil {
+		r.reply <- errStreamCanceled
+	}
+	return true
+}
+
+func dropAfterCancel(t byte) bool {
+	switch t {
+	case protocol.MsgData, protocol.MsgFin, protocol.MsgOpenOK, protocol.MsgOpenFail:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Sender) appendWithRetryLocked(body []byte, opts *imap.AppendOptions) error {

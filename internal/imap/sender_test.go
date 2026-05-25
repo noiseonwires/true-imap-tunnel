@@ -166,6 +166,48 @@ func TestSendBatchReportsFailureAfterAppendRetries(t *testing.T) {
 	}
 }
 
+func TestSendBatchDropsCanceledDataButAllowsRst(t *testing.T) {
+	s := testSender()
+	streamID := uint32(42)
+	s.CancelStream(streamID)
+
+	appends := 0
+	s.appendHook = func([]byte) error {
+		appends++
+		return nil
+	}
+
+	data := testReq(protocol.MsgData, streamID)
+	data.reply = make(chan error, 1)
+	rst := testReq(protocol.MsgRst, streamID)
+	rst.reply = make(chan error, 1)
+
+	s.sendBatch([]*sendReq{data, rst})
+
+	select {
+	case err := <-data.reply:
+		if !errors.Is(err, errStreamCanceled) {
+			t.Fatalf("DATA error = %v, want %v", err, errStreamCanceled)
+		}
+	default:
+		t.Fatal("DATA reply was not signaled")
+	}
+	select {
+	case err := <-rst.reply:
+		if err != nil {
+			t.Fatalf("RST error = %v, want nil", err)
+		}
+	default:
+		t.Fatal("RST reply was not signaled")
+	}
+	if appends != 1 {
+		t.Fatalf("appends = %d, want 1", appends)
+	}
+	if got := s.SentCount(); got != 1 {
+		t.Fatalf("SentCount = %d, want 1", got)
+	}
+}
+
 func testSender() *Sender {
 	return &Sender{
 		acc: &config.AccountConfig{

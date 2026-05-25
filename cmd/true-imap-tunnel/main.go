@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/true-imap-tunnel/true-imap-tunnel/internal/config"
+	"github.com/true-imap-tunnel/true-imap-tunnel/internal/diag"
 	"github.com/true-imap-tunnel/true-imap-tunnel/internal/netprotect"
 	"github.com/true-imap-tunnel/true-imap-tunnel/internal/tlog"
 	"github.com/true-imap-tunnel/true-imap-tunnel/internal/tunnel"
@@ -184,6 +185,11 @@ func main() {
 		fmt.Printf("log_level: %s\n", level)
 		fmt.Printf("message_format: %s\n", cfg.EffectiveMessageFormat())
 		fmt.Printf("client_version: %s\n", cfg.ClientVersion)
+		if diag.Disabled(cfg.StatusAddr) {
+			fmt.Printf("status_addr: disabled\n")
+		} else {
+			fmt.Printf("status_addr: %s\n", cfg.StatusAddr)
+		}
 		if cfg.EffectiveMessageFormat() == "attachment" {
 			fmt.Printf("attachment_filename: %q\n", cfg.EffectiveAttachmentFilename())
 		}
@@ -250,6 +256,14 @@ func main() {
 		tlog.Errorf("tunnel init: %v", err)
 		os.Exit(1)
 	}
+	if !diag.Disabled(cfg.StatusAddr) {
+		statusServer := diag.NewServer(cfg.StatusAddr, func() any { return t.StatusSnapshot() })
+		if err := statusServer.Start(ctx); err != nil {
+			tlog.Warnf("status API disabled: %v", err)
+		} else {
+			statusServer.InstallLogSink()
+		}
+	}
 
 	// Optional custom DNS fallback. When unset, the system resolver is used.
 	if err := applyDNSOverride(cfg); err != nil {
@@ -293,6 +307,7 @@ func loadSIP003Config() (*config.Config, error) {
 		}
 		applySIP003Endpoint(cfg)
 		applySIP003ClientIDOverride(cfg)
+		defaultSIP003StatusAddr(cfg)
 		if err := cfg.Validate(); err != nil {
 			return nil, err
 		}
@@ -333,15 +348,18 @@ func loadSIP003Config() (*config.Config, error) {
 		ActivePollDurationMs:    optionInt(opts, "active_poll_duration_ms", 0),
 		LazyExpungeThreshold_:   optionInt(opts, "lazy_expunge_threshold", 0),
 		LazyExpungeMaxAgeMs:     optionInt(opts, "lazy_expunge_max_age_ms", 0),
-		PingIntervalMs:          optionInt(opts, "ping_interval_ms", 0),
-		MessageFormat:           optionString(opts, "message_format", "attachment"),
-		AttachmentFilename:      opts["attachment_filename"],
-		MultipathMode:           config.MultipathMode(optionString(opts, "multipath_mode", string(config.MultipathModeStreamAffinity))),
-		EncryptionPassphrase:    opts["encryption_passphrase"],
-		PidFile:                 opts["pid_file"],
-		GracefulShutdownMs:      optionInt(opts, "graceful_shutdown_ms", 0),
-		ClientID:                optionUint8(opts, "client_id", 0),
-		ClientVersion:           opts["client_version"],
+		StartupCleanupConnection: config.StartupCleanupConnection(optionString(opts, "startup_cleanup_connection",
+			string(config.StartupCleanupConnectionFallback))),
+		PingIntervalMs:       optionInt(opts, "ping_interval_ms", 0),
+		MessageFormat:        optionString(opts, "message_format", "attachment"),
+		AttachmentFilename:   opts["attachment_filename"],
+		MultipathMode:        config.MultipathMode(optionString(opts, "multipath_mode", string(config.MultipathModeStreamAffinity))),
+		EncryptionPassphrase: opts["encryption_passphrase"],
+		PidFile:              opts["pid_file"],
+		GracefulShutdownMs:   optionInt(opts, "graceful_shutdown_ms", 0),
+		ClientID:             optionUint8(opts, "client_id", 0),
+		ClientVersion:        opts["client_version"],
+		StatusAddr:           optionString(opts, "status_addr", diag.DefaultAndroidAddr),
 	}
 	if cfg.Mode == config.ModeClient {
 		cfg.Listen = net.JoinHostPort(localHost, localPort)
@@ -356,10 +374,17 @@ func loadSIP003Config() (*config.Config, error) {
 	}
 	cfg.Accounts = parseSIP003Accounts(opts)
 	applySIP003ClientIDOverride(cfg)
+	defaultSIP003StatusAddr(cfg)
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+func defaultSIP003StatusAddr(cfg *config.Config) {
+	if strings.TrimSpace(cfg.StatusAddr) == "" {
+		cfg.StatusAddr = diag.DefaultAndroidAddr
+	}
 }
 
 func applySIP003Endpoint(cfg *config.Config) {
@@ -632,40 +657,42 @@ type ssURLYAMLAccount struct {
 }
 
 type ssURLYAMLConfigDoc struct {
-	Mode                    config.Mode          `yaml:"mode"`
-	LogLevel                string               `yaml:"log_level,omitempty"`
-	Listen                  string               `yaml:"listen,omitempty"`
-	Target                  string               `yaml:"target,omitempty"`
-	ClientID                uint8                `yaml:"client_id,omitempty"`
-	ClientVersion           string               `yaml:"client_version,omitempty"`
-	Accounts                []ssURLYAMLAccount   `yaml:"accounts"`
-	Reorder                 *bool                `yaml:"reorder,omitempty"`
-	MultipathMode           config.MultipathMode `yaml:"multipath_mode,omitempty"`
-	OpenTimeoutSec          int                  `yaml:"open_timeout_sec,omitempty"`
-	DialTimeoutSec          int                  `yaml:"dial_timeout_sec,omitempty"`
-	ReconnectInitialDelayMs int                  `yaml:"reconnect_initial_delay_ms,omitempty"`
-	ReconnectMaxDelayMs     int                  `yaml:"reconnect_max_delay_ms,omitempty"`
-	ReconnectBackoff        float64              `yaml:"reconnect_backoff,omitempty"`
-	PollIntervalMs          int                  `yaml:"poll_interval_ms,omitempty"`
-	ActivePollIntervalMs    int                  `yaml:"active_poll_interval_ms,omitempty"`
-	ActivePollDurationMs    int                  `yaml:"active_poll_duration_ms,omitempty"`
-	LazyExpungeThreshold    int                  `yaml:"lazy_expunge_threshold,omitempty"`
-	LazyExpungeMaxAgeMs     int                  `yaml:"lazy_expunge_max_age_ms,omitempty"`
-	PingIntervalMs          int                  `yaml:"ping_interval_ms,omitempty"`
-	MessageFormat           string               `yaml:"message_format,omitempty"`
-	AttachmentFilename      string               `yaml:"attachment_filename,omitempty"`
-	EncryptionPassphrase    string               `yaml:"encryption_passphrase,omitempty"`
-	DNSServers              []string             `yaml:"dns_servers,omitempty"`
-	PidFile                 string               `yaml:"pid_file,omitempty"`
-	GracefulShutdownMs      int                  `yaml:"graceful_shutdown_ms,omitempty"`
-	BatchDelayMs            *int                 `yaml:"batch_delay_ms,omitempty"`
-	BatchMaxFrames          int                  `yaml:"batch_max_frames,omitempty"`
-	BatchMaxKB              int                  `yaml:"batch_max_kb,omitempty"`
-	BatchQueueSize          int                  `yaml:"batch_queue_size,omitempty"`
-	AsyncDataSend           bool                 `yaml:"async_data_send,omitempty"`
-	InboundQueueSize        int                  `yaml:"inbound_queue_size,omitempty"`
-	InboundQueueWaitMs      int                  `yaml:"inbound_queue_wait_ms,omitempty"`
-	ZeroRTTOpen             *bool                `yaml:"zero_rtt_open,omitempty"`
+	Mode                     config.Mode                     `yaml:"mode"`
+	LogLevel                 string                          `yaml:"log_level,omitempty"`
+	Listen                   string                          `yaml:"listen,omitempty"`
+	Target                   string                          `yaml:"target,omitempty"`
+	ClientID                 uint8                           `yaml:"client_id,omitempty"`
+	ClientVersion            string                          `yaml:"client_version,omitempty"`
+	StatusAddr               string                          `yaml:"status_addr,omitempty"`
+	Accounts                 []ssURLYAMLAccount              `yaml:"accounts"`
+	Reorder                  *bool                           `yaml:"reorder,omitempty"`
+	MultipathMode            config.MultipathMode            `yaml:"multipath_mode,omitempty"`
+	OpenTimeoutSec           int                             `yaml:"open_timeout_sec,omitempty"`
+	DialTimeoutSec           int                             `yaml:"dial_timeout_sec,omitempty"`
+	ReconnectInitialDelayMs  int                             `yaml:"reconnect_initial_delay_ms,omitempty"`
+	ReconnectMaxDelayMs      int                             `yaml:"reconnect_max_delay_ms,omitempty"`
+	ReconnectBackoff         float64                         `yaml:"reconnect_backoff,omitempty"`
+	PollIntervalMs           int                             `yaml:"poll_interval_ms,omitempty"`
+	ActivePollIntervalMs     int                             `yaml:"active_poll_interval_ms,omitempty"`
+	ActivePollDurationMs     int                             `yaml:"active_poll_duration_ms,omitempty"`
+	LazyExpungeThreshold     int                             `yaml:"lazy_expunge_threshold,omitempty"`
+	LazyExpungeMaxAgeMs      int                             `yaml:"lazy_expunge_max_age_ms,omitempty"`
+	StartupCleanupConnection config.StartupCleanupConnection `yaml:"startup_cleanup_connection,omitempty"`
+	PingIntervalMs           int                             `yaml:"ping_interval_ms,omitempty"`
+	MessageFormat            string                          `yaml:"message_format,omitempty"`
+	AttachmentFilename       string                          `yaml:"attachment_filename,omitempty"`
+	EncryptionPassphrase     string                          `yaml:"encryption_passphrase,omitempty"`
+	DNSServers               []string                        `yaml:"dns_servers,omitempty"`
+	PidFile                  string                          `yaml:"pid_file,omitempty"`
+	GracefulShutdownMs       int                             `yaml:"graceful_shutdown_ms,omitempty"`
+	BatchDelayMs             *int                            `yaml:"batch_delay_ms,omitempty"`
+	BatchMaxFrames           int                             `yaml:"batch_max_frames,omitempty"`
+	BatchMaxKB               int                             `yaml:"batch_max_kb,omitempty"`
+	BatchQueueSize           int                             `yaml:"batch_queue_size,omitempty"`
+	AsyncDataSend            bool                            `yaml:"async_data_send,omitempty"`
+	InboundQueueSize         int                             `yaml:"inbound_queue_size,omitempty"`
+	InboundQueueWaitMs       int                             `yaml:"inbound_queue_wait_ms,omitempty"`
+	ZeroRTTOpen              *bool                           `yaml:"zero_rtt_open,omitempty"`
 }
 
 func compactYAMLConfig(cfg *config.Config) ([]byte, error) {
@@ -700,6 +727,9 @@ func compactYAMLConfig(cfg *config.Config) ([]byte, error) {
 	}
 	if cfg.ClientVersion != "" {
 		doc.ClientVersion = cfg.ClientVersion
+	}
+	if cfg.StatusAddr != "" {
+		doc.StatusAddr = cfg.StatusAddr
 	}
 	if cfg.Reorder != nil && !cfg.ReorderEnabled() {
 		v := false
@@ -737,6 +767,9 @@ func compactYAMLConfig(cfg *config.Config) ([]byte, error) {
 	}
 	if cfg.LazyExpungeMaxAgeMs != 0 && cfg.LazyExpungeMaxAgeMs != 30000 {
 		doc.LazyExpungeMaxAgeMs = cfg.LazyExpungeMaxAgeMs
+	}
+	if cfg.EffectiveStartupCleanupConnection() != config.StartupCleanupConnectionFallback {
+		doc.StartupCleanupConnection = cfg.EffectiveStartupCleanupConnection()
 	}
 	if cfg.PingIntervalMs != 0 {
 		doc.PingIntervalMs = cfg.PingIntervalMs
@@ -827,6 +860,7 @@ func ssURLQueryOptions(cfg *config.Config, skipDefaults bool) (string, error) {
 	addString("log_level", cfg.LogLevel, "info")
 	addInt("client_id", int(cfg.ClientID), 0)
 	addString("client_version", cfg.ClientVersion, "")
+	addString("status_addr", cfg.StatusAddr, "")
 	if !skipDefaults || !cfg.ReorderEnabled() {
 		addBool("reorder", cfg.ReorderEnabled(), true)
 	}
@@ -845,6 +879,10 @@ func ssURLQueryOptions(cfg *config.Config, skipDefaults bool) (string, error) {
 	addInt("active_poll_duration_ms", cfg.ActivePollDurationMs, 5000)
 	addInt("lazy_expunge_threshold", cfg.LazyExpungeThreshold_, 16)
 	addInt("lazy_expunge_max_age_ms", cfg.LazyExpungeMaxAgeMs, 30000)
+	if cfg.EffectiveStartupCleanupConnection() != config.StartupCleanupConnectionFallback || !skipDefaults {
+		addString("startup_cleanup_connection", string(cfg.EffectiveStartupCleanupConnection()),
+			string(config.StartupCleanupConnectionFallback))
+	}
 	addInt("ping_interval_ms", cfg.PingIntervalMs, 0)
 	addString("message_format", cfg.EffectiveMessageFormat(), "attachment")
 	addString("attachment_filename", cfg.AttachmentFilename, "tunnel.bin")

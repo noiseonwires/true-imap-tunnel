@@ -19,7 +19,9 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Level orders messages from most to least severe.
@@ -34,11 +36,27 @@ const (
 )
 
 var level atomic.Int32
+var sinksMu sync.Mutex
+var sinks []Sink
+
+// Sink receives already-formatted log lines that passed level filtering.
+// It is intended for in-process diagnostics such as the Android status UI.
+type Sink func(at time.Time, level Level, line string)
 
 func init() { level.Store(int32(LevelInfo)) }
 
 // SetLevel installs the global threshold.
 func SetLevel(l Level) { level.Store(int32(l)) }
+
+// AddSink registers an in-process log sink. Sinks must not call back into tlog.
+func AddSink(s Sink) {
+	if s == nil {
+		return
+	}
+	sinksMu.Lock()
+	defer sinksMu.Unlock()
+	sinks = append(sinks, s)
+}
 
 // CurrentLevel returns the current threshold.
 func CurrentLevel() Level { return Level(level.Load()) }
@@ -82,43 +100,52 @@ func (l Level) String() string {
 	return fmt.Sprintf("level(%d)", int32(l))
 }
 
-func emit(tag string, format string, args ...any) {
+func emit(l Level, tag string, format string, args ...any) {
+	line := fmt.Sprintf(format, args...)
 	// Add the level tag in the prefix slot used by the original log
 	// lines. The standard logger prepends date/time itself.
-	log.Output(3, "["+tag+"] "+fmt.Sprintf(format, args...))
+	log.Output(3, "["+tag+"] "+line)
+
+	sinksMu.Lock()
+	copied := append([]Sink(nil), sinks...)
+	sinksMu.Unlock()
+	at := time.Now()
+	for _, sink := range copied {
+		sink(at, l, line)
+	}
 }
 
 // Errorf logs at LevelError.
 func Errorf(format string, args ...any) {
 	if Enabled(LevelError) {
-		emit("ERROR", format, args...)
+		emit(LevelError, "ERROR", format, args...)
 	}
 }
 
 // Warnf logs at LevelWarn.
 func Warnf(format string, args ...any) {
 	if Enabled(LevelWarn) {
-		emit("WARN", format, args...)
+		emit(LevelWarn, "WARN", format, args...)
 	}
 }
 
 // Infof logs at LevelInfo.
 func Infof(format string, args ...any) {
 	if Enabled(LevelInfo) {
-		emit("INFO", format, args...)
+		emit(LevelInfo, "INFO", format, args...)
 	}
 }
 
 // Debugf logs at LevelDebug.
 func Debugf(format string, args ...any) {
 	if Enabled(LevelDebug) {
-		emit("DEBUG", format, args...)
+		emit(LevelDebug, "DEBUG", format, args...)
 	}
 }
 
 // Tracef logs at LevelTrace.
 func Tracef(format string, args ...any) {
 	if Enabled(LevelTrace) {
-		emit("TRACE", format, args...)
+		emit(LevelTrace, "TRACE", format, args...)
 	}
 }

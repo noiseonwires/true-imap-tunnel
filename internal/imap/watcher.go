@@ -93,6 +93,10 @@ type Watcher struct {
 	// DATA that arrived while the watcher was reconnecting.
 	startupCleanupDone bool
 	receiveReady       atomic.Bool
+	connected          atomic.Bool
+	connects           atomic.Uint64
+	connectedAtNS      atomic.Int64
+	idleSupported      atomic.Int32
 
 	failDelay time.Duration
 }
@@ -100,7 +104,7 @@ type Watcher struct {
 // NewWatcher constructs (but does not connect) a Watcher. aead may be
 // nil to disable per-frame decryption.
 func NewWatcher(cfg *config.Config, acc *config.AccountConfig, handler FrameHandler, aead *titcrypto.AEAD) *Watcher {
-	return &Watcher{
+	w := &Watcher{
 		acc:       acc,
 		cfg:       cfg,
 		handler:   handler,
@@ -109,6 +113,8 @@ func NewWatcher(cfg *config.Config, acc *config.AccountConfig, handler FrameHand
 		kick:      make(chan struct{}, 1),
 		failDelay: cfg.ReconnectInitialDelay(),
 	}
+	w.idleSupported.Store(-1)
+	return w
 }
 
 // Kick puts the watcher into active-polling mode for cfg.ActivePollDuration.
@@ -147,6 +153,33 @@ func (w *Watcher) FramesReceived() uint64 { return w.framesReceived.Load() }
 // race a response into the startup snapshot and make that response look stale.
 func (w *Watcher) ReceiveReady() bool { return w.receiveReady.Load() }
 
+// Connected reports whether the watcher currently holds an open connection.
+func (w *Watcher) Connected() bool { return w.connected.Load() }
+
+// ConnectedAt returns the time of the most recent successful connection.
+func (w *Watcher) ConnectedAt() time.Time {
+	ns := w.connectedAtNS.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// ConnectCount returns the number of successful IMAP connections.
+func (w *Watcher) ConnectCount() uint64 { return w.connects.Load() }
+
+// IdleSupported reports whether the current watcher connection supports IDLE.
+func (w *Watcher) IdleSupported() (bool, bool) {
+	switch w.idleSupported.Load() {
+	case 0:
+		return false, true
+	case 1:
+		return true, true
+	default:
+		return false, false
+	}
+}
+
 // LastFrameAt returns the wall-clock time of the most recent
 // successfully-decoded frame, or the zero Time if none have been seen.
 // Unlike FramesReceived this value persists across reconnects, so
@@ -173,8 +206,11 @@ func (w *Watcher) Run(ctx context.Context) {
 		// it again.
 		w.framesReceived.Store(0)
 		w.receiveReady.Store(false)
+		w.connected.Store(false)
+		w.idleSupported.Store(-1)
 		err := w.runOnce(ctx)
 		w.receiveReady.Store(false)
+		w.connected.Store(false)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			tlog.Warnf("watcher %s: %v (retrying in %v)",
 				w.acc.Label(), err, w.failDelay)
@@ -244,6 +280,9 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 	}
 	w.mu.Lock()
 	w.client = c
+	w.connected.Store(true)
+	w.connects.Add(1)
+	w.connectedAtNS.Store(time.Now().UnixNano())
 	w.mu.Unlock()
 
 	if err := ensureMailbox(c, w.acc.FolderRecv); err != nil {
@@ -274,15 +313,16 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 		w.lastUID = sel.UIDNext - 1
 	}
 	w.receiveReady.Store(true)
-	// Clean leftover OWNED messages from before this watcher started, but
-	// never on the hot receive connection. Fetching/deleting a large stale
-	// folder can take many seconds on mobile IMAP providers; doing that here
-	// would delay the first PONG/OPEN_OK and make Android look connected but
-	// unusable. The cleanup is intentionally once per Watcher lifecycle only:
-	// on IMAP reconnect, messages in the mailbox may be live traffic that
-	// arrived while the watcher was reconnecting.
+	// Clean leftover OWNED messages from before this watcher started. By
+	// default this runs on a short-lived extra connection so a large stale
+	// folder does not delay the hot receive loop. Strict IMAP servers that
+	// reject concurrent sessions can opt into using this main watcher
+	// connection instead, or into dedicated-with-main-fallback mode.
+	// The cleanup is intentionally once per Watcher lifecycle only: on IMAP
+	// reconnect, messages in the mailbox may be live traffic that arrived
+	// while the watcher was reconnecting.
 	if !w.startupCleanupDone && sel.NumMessages > 0 && w.lastUID > 0 {
-		w.startStartupCleanup(ctx, w.lastUID, sel.UIDValidity, sel.NumMessages)
+		w.startStartupCleanup(ctx, c, w.lastUID, sel.UIDValidity, sel.NumMessages)
 	}
 	w.startupCleanupDone = true
 
@@ -297,8 +337,16 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 	// don't implement it, so we fall back to NOOP polling at a
 	// configured interval.
 	caps := c.Caps()
-	useIdle := caps.Has(imap.CapIdle) || caps.Has(imap.CapIMAP4rev2)
-	if !useIdle {
+	useIdle := !w.cfg.DisableIdle && (caps.Has(imap.CapIdle) || caps.Has(imap.CapIMAP4rev2))
+	if useIdle {
+		w.idleSupported.Store(1)
+	} else {
+		w.idleSupported.Store(0)
+	}
+	if w.cfg.DisableIdle && (caps.Has(imap.CapIdle) || caps.Has(imap.CapIMAP4rev2)) {
+		tlog.Infof("watcher %s: IDLE disabled by config — using NOOP polling every %v",
+			w.acc.Label(), w.cfg.PollInterval())
+	} else if !useIdle {
 		tlog.Infof("watcher %s: server does not advertise IDLE — falling back to NOOP polling every %v",
 			w.acc.Label(), w.cfg.PollInterval())
 	}
@@ -361,12 +409,9 @@ func (w *Watcher) waitIdle(ctx context.Context, c *imapclient.Client) error {
 	return nil
 }
 
-// waitPoll sleeps for the configured poll interval before returning to
-// the main loop, which then runs FETCH directly on lastUID+1:*. We do
-// NOT send a separate NOOP — FETCH on a non-existent UID range is well
-// defined (RFC 9051) and returns just a tagged OK, so it's cheaper than
-// NOOP+FETCH (saves one round-trip whenever there IS new data, costs
-// the same when there isn't).
+// waitPoll sleeps for the configured poll interval, issues NOOP to force
+// selected-mailbox state refresh on non-IDLE servers, then returns to the
+// main loop, which runs FETCH on lastUID+1:*.
 //
 // The poll uses ActivePollInterval (default 100ms) while the watcher is
 // in active mode, and PollInterval (default 3s) otherwise. Active mode
@@ -390,6 +435,9 @@ func (w *Watcher) waitPoll(ctx context.Context, c *imapclient.Client) error {
 		// Sender on this side just APPENDed — go check for a response
 		// right away using the active interval. Drop the sleep entirely.
 	case <-time.After(interval):
+	}
+	if err := c.Noop().Wait(); err != nil {
+		return fmt.Errorf("noop poll: %w", err)
 	}
 	// Drain notify and kick — fetchAndProcess will pick up everything
 	// by UID regardless.
@@ -684,9 +732,33 @@ func (w *Watcher) fetchAndProcess(ctx context.Context) error {
 	return nil
 }
 
-func (w *Watcher) startStartupCleanup(ctx context.Context, maxUID imap.UID, uidValidity uint32, numMessages uint32) {
+func (w *Watcher) startStartupCleanup(ctx context.Context, c *imapclient.Client, maxUID imap.UID, uidValidity uint32, numMessages uint32) {
 	tlog.Infof("watcher %s: startup cleanup scheduled for %d existing message(s) up to UID %d",
 		w.acc.Label(), numMessages, maxUID)
+	switch w.cfg.EffectiveStartupCleanupConnection() {
+	case config.StartupCleanupConnectionMain:
+		if err := w.cleanupStartupMessagesOnMain(ctx, c, maxUID); err != nil && ctx.Err() == nil {
+			tlog.Warnf("watcher %s: startup cleanup failed on main connection: %v",
+				w.acc.Label(), err)
+		}
+	case config.StartupCleanupConnectionFallback:
+		if err := w.cleanupStartupMessages(ctx, maxUID, uidValidity); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			tlog.Warnf("watcher %s: startup cleanup dedicated connection failed, retrying on main connection: %v",
+				w.acc.Label(), err)
+			if err := w.cleanupStartupMessagesOnMain(ctx, c, maxUID); err != nil && ctx.Err() == nil {
+				tlog.Warnf("watcher %s: startup cleanup fallback failed on main connection: %v",
+					w.acc.Label(), err)
+			}
+		}
+	default:
+		w.startDedicatedStartupCleanup(ctx, maxUID, uidValidity)
+	}
+}
+
+func (w *Watcher) startDedicatedStartupCleanup(ctx context.Context, maxUID imap.UID, uidValidity uint32) {
 	go func() {
 		if err := w.cleanupStartupMessages(ctx, maxUID, uidValidity); err != nil {
 			if ctx.Err() == nil {
@@ -726,6 +798,18 @@ func (w *Watcher) cleanupStartupMessages(ctx context.Context, maxUID imap.UID, u
 			uidValidity, sel.UIDValidity)
 	}
 
+	return w.cleanupStartupMessagesOnSelected(c, maxUID)
+}
+
+func (w *Watcher) cleanupStartupMessagesOnMain(ctx context.Context, c *imapclient.Client, maxUID imap.UID) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	tlog.Infof("watcher %s: startup cleanup using main IMAP connection", w.acc.Label())
+	return w.cleanupStartupMessagesOnSelected(c, maxUID)
+}
+
+func (w *Watcher) cleanupStartupMessagesOnSelected(c *imapclient.Client, maxUID imap.UID) error {
 	uidSet := imap.UIDSet{}
 	uidSet.AddRange(1, maxUID)
 	start := time.Now()

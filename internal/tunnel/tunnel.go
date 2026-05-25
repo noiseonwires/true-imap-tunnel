@@ -17,7 +17,15 @@ import (
 	"github.com/true-imap-tunnel/true-imap-tunnel/internal/tlog"
 )
 
-const maxPingClientVersionLen = 256
+const (
+	maxPingClientVersionLen = 256
+
+	// In one-shot ping mode (ping_interval_ms: 0), keep probing during startup
+	// so slower accounts that connect after the first path can still become
+	// proven and enter normal multipath routing.
+	startupPingProbeInterval = time.Second
+	startupPingProbeWindow   = 30 * time.Second
+)
 
 // Tunnel is the top-level glue: a multipath IMAP transport, a stream
 // manager, and either a TCP listener (client mode) or a target dialer
@@ -89,6 +97,19 @@ func New(cfg *config.Config) (*Tunnel, error) {
 	t.streams.Reorder = cfg.ReorderEnabled()
 	t.streams.InboundQueueSize = cfg.InboundQueueSize()
 	t.streams.OutboundQueueWait = cfg.InboundQueueWait()
+	t.streams.OnReorderReset = func(streamID uint32) {
+		label := t.paths.RouteLabel(streamID)
+		rst := protocol.Frame{Type: protocol.MsgRst, StreamID: streamID}
+		var err error
+		if label != "" {
+			err = t.paths.SendViaLabel(label, rst)
+		} else {
+			err = t.paths.Send(rst)
+		}
+		if err != nil {
+			tlog.Debugf("reorder reset RST send failed stream=%d: %v", streamID, err)
+		}
+	}
 
 	// Multi-client filter: when ClientID is set on a client, only
 	// messages whose stream is tagged with that client-id are processed
@@ -111,6 +132,7 @@ func New(cfg *config.Config) (*Tunnel, error) {
 	t.streams.OnRemove = func(streamID uint32) {
 		tlog.Infof("stream closed stream=%d client_id=%d mode=%s account=%q active_streams=%d",
 			streamID, protocol.StreamClientID(streamID), cfg.Mode, t.paths.RouteLabel(streamID), t.streams.Count())
+		t.paths.CancelStream(streamID)
 		t.paths.RemoveRoute(streamID)
 		// Also wake any pending OPEN goroutine that was waiting on this
 		// stream ID — there shouldn't be one (since pending entries are
@@ -243,12 +265,14 @@ func (t *Tunnel) gracefulShutdown() {
 	}
 }
 
-// runPingLoop sends a Ping once after the IMAP transport has at least
-// one connected sender, and (optionally) keeps re-sending on a fixed
-// cadence. dispatchOrdered logs the round-trip latency when the
-// matching Pong returns. The first 8 payload bytes are the big-endian
-// UnixNano send timestamp, optionally followed by a UTF-8 client version
-// string for server-side diagnostics.
+// runPingLoop sends Pings after the IMAP transport has at least one ready path.
+// In one-shot mode it keeps probing unproven paths for a short startup window
+// so accounts that connect a few seconds later can still become eligible for
+// multipath routing. In periodic mode it keeps re-sending on a fixed cadence.
+// dispatchOrdered logs the round-trip latency when the matching Pong returns.
+// The first 8 payload bytes are the big-endian UnixNano send timestamp,
+// optionally followed by a UTF-8 client version string for server-side
+// diagnostics.
 func (t *Tunnel) runPingLoop(ctx context.Context) {
 	// Wait for at least one sender and one receive-ready watcher before
 	// probing. Sending before the watcher has established its UID baseline can
@@ -261,13 +285,17 @@ func (t *Tunnel) runPingLoop(ctx context.Context) {
 		}
 	}
 
-	// sendConnected sends a Ping through every connected sender so each path
+	// sendConnected sends a Ping through every locally ready sender so each path
 	// independently gets proven by its Pong. Without this, the first
 	// account to respond would become "proven" and the proven-filter
 	// would starve all other accounts forever.
-	sendConnected := func() {
+	sendConnected := func(onlyUnproven bool) int {
+		sent := 0
 		for i := 0; i < t.paths.SenderCount(); i++ {
-			if !t.paths.SenderConnected(i) {
+			if !t.paths.SenderConnected(i) || !t.paths.ReceiveReady(i) {
+				continue
+			}
+			if onlyUnproven && t.paths.PathProven(i) {
 				continue
 			}
 			if err := t.paths.SendVia(i, protocol.Frame{
@@ -276,8 +304,11 @@ func (t *Tunnel) runPingLoop(ctx context.Context) {
 				Payload:  buildPingPayload(time.Now(), t.cfg.ClientVersion),
 			}); err != nil {
 				tlog.Debugf("ping send via account %d failed: %v", i, err)
+			} else {
+				sent++
 			}
 		}
+		return sent
 	}
 
 	// Always probe once on connect — that's the user's first signal
@@ -286,10 +317,29 @@ func (t *Tunnel) runPingLoop(ctx context.Context) {
 		tlog.Infof("ping loop: one probe now, then every %v",
 			t.cfg.PingInterval())
 	} else {
-		tlog.Infof("ping loop: single probe (set ping_interval_ms > 0 for repeats)")
+		tlog.Infof("ping loop: startup probes until all paths are proven or %v elapses (set ping_interval_ms > 0 for repeats)",
+			startupPingProbeWindow)
 	}
-	sendConnected()
+	sendConnected(false)
 	if !t.cfg.PingPeriodic() {
+		ticker := time.NewTicker(startupPingProbeInterval)
+		defer ticker.Stop()
+		deadline := time.NewTimer(startupPingProbeWindow)
+		defer deadline.Stop()
+		for t.paths.ProvenCount() < t.paths.SenderCount() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-deadline.C:
+				if proven, total := t.paths.ProvenCount(), t.paths.SenderCount(); proven < total {
+					tlog.Infof("ping loop: startup probe window ended with %d/%d proven path(s)",
+						proven, total)
+				}
+				return
+			case <-ticker.C:
+				sendConnected(true)
+			}
+		}
 		return
 	}
 
@@ -300,7 +350,7 @@ func (t *Tunnel) runPingLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			sendConnected()
+			sendConnected(false)
 		}
 	}
 }

@@ -55,6 +55,7 @@ accounts:
     username: "tunnel@example.com"
     password: "app-password"
     tls: "implicit"
+    insecure_skip_verify: false
     folder_send: "TunnelC2S"
     folder_recv: "TunnelS2C"
 
@@ -101,6 +102,16 @@ Run:
 These options can be used on both sides unless noted otherwise.
 
 ```yaml
+# Log verbosity: error, warn, info, debug, or trace.
+log_level: info
+
+# Optional local diagnostics HTTP API. Empty disables it for normal YAML configs.
+# Use "off" to disable environments that inject a default.
+# status_addr: "127.123.45.67:17680"
+
+# Optional custom client build/version label included in Ping payloads.
+# client_version: "manual-build"
+
 # Optional fallback. If omitted and local DNS fails at startup, 1.1.1.1:53 is used.
 dns_servers:
   - "1.1.1.1"
@@ -110,12 +121,20 @@ encryption_passphrase: "same secret on both sides"
 
 # Receiver behavior.
 reorder: true
+multipath_mode: stream_affinity # stream_affinity or frame_round_robin
+open_timeout_sec: 30
+dial_timeout_sec: 10
+reconnect_initial_delay_ms: 500
+reconnect_max_delay_ms: 30000
+reconnect_backoff: 1.5
 poll_interval_ms: 3000 # this is for servers that don't support IDLE
+disable_idle: false # force NOOP+FETCH polling even if IDLE is advertised
 active_poll_interval_ms: 100
 active_poll_duration_ms: 5000
 
 lazy_expunge_threshold: 16
 lazy_expunge_max_age_ms: 30000
+startup_cleanup_connection: fallback # dedicated, main, or fallback
 
 # Sender batching.
 batch_delay_ms: 2        # 0 disables; 1-5 ms is usually good
@@ -124,8 +143,16 @@ batch_max_kb: 256
 batch_queue_size: 256
 async_data_send: true
 
+# Per-stream TCP-write buffering on receive side.
+inbound_queue_size: 64
+inbound_queue_wait_ms: 30000
+
 # Optional startup RTT probe. 0 = probe once; >0 repeats every N ms; <0 disables.
 ping_interval_ms: 0
+
+# Optional stale process cleanup and graceful shutdown behavior.
+# pid_file: "true-imap-tunnel.pid"
+graceful_shutdown_ms: 3000
 
 # Experimental. May reduce startup latency, but can also cause funny issues.
 # zero_rtt_open: true
@@ -160,10 +187,18 @@ plain IMAP passwords are disabled there.
   opt-in. Early DATA may need to be buffered or discarded if the server-side
   target dial is late or fails, so use it only after testing the actual protocol
   you plan to tunnel.
-- `poll_interval_ms` matters only when IDLE is missing or during safety fetches.
-  Polling is inherently slower and may feel unreliable compared with IDLE.
+- `disable_idle: true` forces NOOP+FETCH polling even when the server advertises
+  IDLE. Use it for testing or for providers with buggy IDLE support.
+- `poll_interval_ms` matters when IDLE is disabled/missing or during safety
+  fetches. Polling is inherently slower and may feel unreliable compared with
+  IDLE.
 - `lazy_expunge_threshold: 1` forces immediate cleanup if your IMAP server has
   strict folder quotas, at the cost of extra IMAP round trips.
+- `startup_cleanup_connection: fallback` is the default: it tries old-message
+  cleanup on a short-lived dedicated connection first, then retries on the
+  watcher connection if the extra connection fails. Use `main` for IMAP servers
+  that reject even attempted concurrent connections; use `dedicated` only when
+  you want the old fast-only behavior.
 
 ## Customizing how messages look in the mailbox
 
@@ -211,7 +246,10 @@ multipath_mode: frame_round_robin
 `frame_round_robin` can spread DATA frames from one stream across multiple
 connected/proven accounts. This may improve bandwidth for one heavy stream, but
 it is experimental and may be unstable: more reordering, jitter, and edge cases
-are expected. Use it only on both sides and only after validating your workload.
+are expected. If the IMAP servers have different latency or performance, this
+mode can overflow the reorder buffer and reset the connection. Prefer
+`stream_affinity`; use `frame_round_robin` only on both sides and only if you
+accept unstable behavior for that workload.
 
 When using multipath:
 

@@ -164,19 +164,44 @@ func (m *Multipath) anyProven() bool {
 	return false
 }
 
+func (m *Multipath) idleSupported(idx int) bool {
+	if idx < 0 || idx >= len(m.watchers) {
+		return false
+	}
+	idle, known := m.watchers[idx].IdleSupported()
+	return known && idle
+}
+
+// idleProvenAvailable reports whether normal traffic should prefer IDLE-capable
+// paths. Non-IDLE paths must still remain probeable via SendVia, and remain a
+// fallback if every preferred path fails.
+func (m *Multipath) idleProvenAvailable() bool {
+	if len(m.senders) < 2 {
+		return false
+	}
+	for idx, s := range m.senders {
+		if s.Connected() && m.proven(idx) && m.idleSupported(idx) {
+			return true
+		}
+	}
+	return false
+}
+
 // Send dispatches one frame.
 //
 // Routing tiers, tried in order:
 //
-//  1. Proven + connected — accounts whose paired watcher has decoded
+//  1. Proven + connected + IDLE-capable, when such a path is available.
+//  2. Proven + connected — accounts whose paired watcher has decoded
 //     at least one frame this connection (known bidirectional).
-//  2. Connected (any) — bootstrap fallback used only while NO account
+//  3. Connected (any) — bootstrap fallback used only while NO account
 //     is proven yet; without it the very first send would have no
 //     candidate, and no send means no proof.
-//  3. Disconnected — last resort; may have just finished backoff.
+//  4. Disconnected — last resort; may have just finished backoff.
 //
 // A recorded stream-affinity route is honoured first while its sender is
-// connected. Proof status only affects fallback/new-route choices.
+// connected, unless an IDLE-proven path is available and the recorded route is
+// non-IDLE. Proof status otherwise only affects fallback/new-route choices.
 // Returns ErrNoSenders when no account is configured, or the last error
 // when all attempts failed.
 func (m *Multipath) Send(f protocol.Frame) error {
@@ -204,12 +229,13 @@ func (m *Multipath) Send(f protocol.Frame) error {
 	}
 
 	useProvenFilter := m.anyProven()
+	preferIdle := m.idleProvenAvailable()
 	var lastErr error
 	triedRoute := false
 
 	if routeIdx >= 0 && routeIdx < n {
 		s := m.senders[routeIdx]
-		if s.Connected() {
+		if s.Connected() && (!preferIdle || m.idleSupported(routeIdx)) {
 			triedRoute = true
 			if err := m.sendOn(s, f); err != nil {
 				tlog.Warnf("multipath: routed sender %s failed: %v", s.Label(), err)
@@ -235,6 +261,9 @@ func (m *Multipath) Send(f protocol.Frame) error {
 		if useProvenFilter && !m.proven(idx) {
 			continue
 		}
+		if preferIdle && !m.idleSupported(idx) {
+			continue
+		}
 		if err := m.sendOn(s, f); err != nil {
 			tlog.Warnf("multipath: sender %s failed: %v", s.Label(), err)
 			lastErr = err
@@ -242,6 +271,28 @@ func (m *Multipath) Send(f protocol.Frame) error {
 		}
 		m.KickWatchers()
 		return nil
+	}
+
+	// If every preferred IDLE-capable path failed, fall back to proven
+	// non-IDLE paths rather than dropping traffic.
+	if preferIdle {
+		for i := 0; i < n; i++ {
+			idx := (start + i) % n
+			if triedRoute && idx == routeIdx {
+				continue
+			}
+			s := m.senders[idx]
+			if !s.Connected() || !m.proven(idx) || m.idleSupported(idx) {
+				continue
+			}
+			if err := m.sendOn(s, f); err != nil {
+				tlog.Warnf("multipath: fallback non-IDLE sender %s failed: %v", s.Label(), err)
+				lastErr = err
+				continue
+			}
+			m.KickWatchers()
+			return nil
+		}
 	}
 
 	// Tier 2: connected but not proven. Only reachable when some
@@ -298,6 +349,7 @@ func (m *Multipath) sendFrameRoundRobin(f protocol.Frame) (error, bool) {
 		return nil, false
 	}
 	start := int(m.rrCounter.Add(1)-1) % n
+	preferIdle := m.idleProvenAvailable()
 	var lastErr error
 	tried := false
 
@@ -305,6 +357,9 @@ func (m *Multipath) sendFrameRoundRobin(f protocol.Frame) (error, bool) {
 		idx := (start + i) % n
 		s := m.senders[idx]
 		if !s.Connected() || !m.proven(idx) {
+			continue
+		}
+		if preferIdle && !m.idleSupported(idx) {
 			continue
 		}
 		tried = true
@@ -332,11 +387,12 @@ func (m *Multipath) sendOn(s *imappkg.Sender, f protocol.Frame) error {
 // AllocRoute picks an account for a new stream and records it.
 //
 // Preference order:
-//  1. Proven + connected (paired watcher has decoded ≥ 1 frame).
-//  2. First connected sender (bootstrap path used until any account is
+//  1. Proven + connected + IDLE-capable, when such a path is available.
+//  2. Proven + connected (paired watcher has decoded ≥ 1 frame).
+//  3. First connected sender (bootstrap path used until any account is
 //     proven). Real streams intentionally do not round-robin across
 //     unproven paths; the ping loop probes each path independently.
-//  3. Round-robin slot regardless of state, as a last-resort default.
+//  4. Round-robin slot regardless of state, as a last-resort default.
 //
 // Returns the chosen index, or -1 if no accounts are configured.
 // Called by the client side when allocating a new stream ID.
@@ -345,14 +401,27 @@ func (m *Multipath) AllocRoute(streamID uint32) int {
 	if n == 0 {
 		return -1
 	}
+	m.AllowStream(streamID)
 	start := int(m.rrCounter.Add(1)-1) % n
 	useProvenFilter := m.anyProven()
+	preferIdle := m.idleProvenAvailable()
 
 	for i := 0; i < n; i++ {
 		idx := (start + i) % n
-		if m.senders[idx].Connected() && (!useProvenFilter || m.proven(idx)) {
+		if m.senders[idx].Connected() &&
+			(!useProvenFilter || m.proven(idx)) &&
+			(!preferIdle || m.idleSupported(idx)) {
 			m.routes.Store(streamID, idx)
 			return idx
+		}
+	}
+	if preferIdle {
+		for i := 0; i < n; i++ {
+			idx := (start + i) % n
+			if m.senders[idx].Connected() && (!useProvenFilter || m.proven(idx)) {
+				m.routes.Store(streamID, idx)
+				return idx
+			}
 		}
 	}
 	// Bootstrap fallback: before any path is proven, keep application
@@ -384,6 +453,7 @@ func (m *Multipath) AllocRoute(streamID uint32) int {
 // to pin outbound traffic for the new stream to the same path the OPEN
 // arrived on. Returns true if a matching account was found.
 func (m *Multipath) PinByLabel(streamID uint32, label string) bool {
+	m.AllowStream(streamID)
 	for i, s := range m.senders {
 		if s.Label() == label {
 			m.routes.Store(streamID, i)
@@ -397,6 +467,24 @@ func (m *Multipath) PinByLabel(streamID uint32, label string) bool {
 // wired to streams.Manager.OnRemove so stale routes don't accumulate.
 func (m *Multipath) RemoveRoute(streamID uint32) {
 	m.routes.Delete(streamID)
+}
+
+// CancelStream tells every sender to drop queued DATA/FIN for streamID. This is
+// used when a stream is locally closed (especially after receiving a peer RST)
+// so async DATA already sitting in sender queues does not keep leaking into IMAP.
+// RST frames are never dropped.
+func (m *Multipath) CancelStream(streamID uint32) {
+	for _, s := range m.senders {
+		s.CancelStream(streamID)
+	}
+}
+
+// AllowStream clears a previous cancellation tombstone when a stream ID is
+// deliberately reintroduced by a fresh OPEN.
+func (m *Multipath) AllowStream(streamID uint32) {
+	for _, s := range m.senders {
+		s.AllowStream(streamID)
+	}
 }
 
 // RouteLabel returns the label of the account pinned for streamID, or
@@ -470,6 +558,12 @@ func (m *Multipath) ProvenCount() int {
 	return n
 }
 
+// PathProven reports whether the account at idx has delivered a frame recently.
+// Out-of-range indexes are treated as not proven.
+func (m *Multipath) PathProven(idx int) bool {
+	return m.proven(idx)
+}
+
 // SenderCount returns the total number of senders.
 func (m *Multipath) SenderCount() int { return len(m.senders) }
 
@@ -480,6 +574,15 @@ func (m *Multipath) SenderConnected(idx int) bool {
 		return false
 	}
 	return m.senders[idx].Connected()
+}
+
+// ReceiveReady reports whether the watcher at idx has selected its mailbox and
+// established the UID baseline used to process future messages.
+func (m *Multipath) ReceiveReady(idx int) bool {
+	if idx < 0 || idx >= len(m.watchers) {
+		return false
+	}
+	return m.watchers[idx].ReceiveReady()
 }
 
 // SendVia dispatches one frame through a specific sender by index.

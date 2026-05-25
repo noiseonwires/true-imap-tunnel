@@ -35,6 +35,12 @@ In Shadowsocks Android VPN mode, the app injects the SIP003 option
 through Shadowsocks' `protect_path` socket so its own transport traffic does not
 loop back into the VPN.
 
+The APK also has a tiny launcher app. Open **T.I.T.S.** while the Shadowsocks
+profile is running to see current tunnel/account status and recent logs. The
+plugin exposes this only on the device loopback address
+`http://127.123.45.67:17680`; set `status_addr=off` in plugin options if you
+need to disable it.
+
 
 
 ## Plugin config formats

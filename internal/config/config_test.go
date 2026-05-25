@@ -35,3 +35,42 @@ func TestBatchDelayExplicitZeroDisables(t *testing.T) {
 		t.Fatalf("BatchDelay() = %v, want 0", got)
 	}
 }
+
+func TestStartupCleanupConnectionDefault(t *testing.T) {
+	cfg, err := LoadBytes([]byte(batchDelayConfigBase))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.EffectiveStartupCleanupConnection(); got != StartupCleanupConnectionFallback {
+		t.Fatalf("EffectiveStartupCleanupConnection() = %q, want %q",
+			got, StartupCleanupConnectionFallback)
+	}
+}
+
+func TestStartupCleanupConnectionDedicated(t *testing.T) {
+	cfg, err := LoadBytes([]byte("startup_cleanup_connection: dedicated\n" + batchDelayConfigBase))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.EffectiveStartupCleanupConnection(); got != StartupCleanupConnectionDedicated {
+		t.Fatalf("EffectiveStartupCleanupConnection() = %q, want %q",
+			got, StartupCleanupConnectionDedicated)
+	}
+}
+
+func TestStartupCleanupConnectionMain(t *testing.T) {
+	cfg, err := LoadBytes([]byte("startup_cleanup_connection: main\n" + batchDelayConfigBase))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.EffectiveStartupCleanupConnection(); got != StartupCleanupConnectionMain {
+		t.Fatalf("EffectiveStartupCleanupConnection() = %q, want %q",
+			got, StartupCleanupConnectionMain)
+	}
+}
+
+func TestStartupCleanupConnectionInvalid(t *testing.T) {
+	if _, err := LoadBytes([]byte("startup_cleanup_connection: shared\n" + batchDelayConfigBase)); err == nil {
+		t.Fatal("LoadBytes accepted invalid startup_cleanup_connection")
+	}
+}

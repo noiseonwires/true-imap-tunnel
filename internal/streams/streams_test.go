@@ -154,6 +154,56 @@ func TestReorderGapLimitResetsStream(t *testing.T) {
 	}
 }
 
+func TestReorderGapResetNotifiesPeerAndDropsLateFrames(t *testing.T) {
+	m := NewManager(func(f protocol.Frame) error { return nil })
+	m.Reorder = true
+	m.MaxReorderPending = 2
+	m.MaxReorderDelay = time.Hour
+
+	var resetIDs []uint32
+	m.OnReorderReset = func(streamID uint32) {
+		resetIDs = append(resetIDs, streamID)
+	}
+
+	var got []protocol.Frame
+	deliver := func(f protocol.Frame) { got = append(got, f) }
+
+	m.DispatchFrame(protocol.Frame{StreamID: 7, SeqID: 2, Type: protocol.MsgData}, deliver)
+	m.DispatchFrame(protocol.Frame{StreamID: 7, SeqID: 3, Type: protocol.MsgData}, deliver)
+	m.DispatchFrame(protocol.Frame{StreamID: 7, SeqID: 4, Type: protocol.MsgData}, deliver)
+
+	for seq := uint32(5); seq < 20; seq++ {
+		m.DispatchFrame(protocol.Frame{StreamID: 7, SeqID: seq, Type: protocol.MsgData}, deliver)
+	}
+
+	if len(resetIDs) != 1 || resetIDs[0] != 7 {
+		t.Fatalf("reset callbacks = %v, want [7]", resetIDs)
+	}
+	if len(got) != 1 || got[0].Type != protocol.MsgRst || got[0].StreamID != 7 {
+		t.Fatalf("delivered %+v, want one local RST", got)
+	}
+}
+
+func TestReorderTombstoneClearedByFreshOpen(t *testing.T) {
+	m := NewManager(func(f protocol.Frame) error { return nil })
+	m.Reorder = true
+
+	m.Remove(9)
+
+	var got []protocol.Frame
+	deliver := func(f protocol.Frame) { got = append(got, f) }
+
+	m.DispatchFrame(protocol.Frame{StreamID: 9, SeqID: 2, Type: protocol.MsgData}, deliver)
+	m.DispatchFrame(protocol.Frame{StreamID: 9, SeqID: 1, Type: protocol.MsgOpen}, deliver)
+
+	if len(got) != 1 {
+		t.Fatalf("got %d delivered frames want fresh OPEN only: %+v", len(got), got)
+	}
+	if got[0].Type != protocol.MsgOpen || got[0].StreamID != 9 || got[0].SeqID != 1 {
+		t.Fatalf("got %+v want fresh OPEN", got[0])
+	}
+}
+
 func TestRstBypassesReorderGap(t *testing.T) {
 	m := NewManager(func(f protocol.Frame) error { return nil })
 	m.Reorder = true
