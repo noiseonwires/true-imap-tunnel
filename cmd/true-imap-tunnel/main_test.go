@@ -56,7 +56,7 @@ func TestBuildClientVersionUsesBuildMetadata(t *testing.T) {
 func TestLoadSIP003ConfigClient(t *testing.T) {
 	t.Setenv("SS_LOCAL_HOST", "127.0.0.1")
 	t.Setenv("SS_LOCAL_PORT", "1081")
-	t.Setenv("SS_PLUGIN_OPTIONS", "imap_host=imap.example.com:993;imap_username=u;imap_password=p;folder_send=c2s;folder_recv=s2c;encryption_passphrase=secret;client_encryption_passphrases=7:seven,8:eight;client_id=7;client_version=test-build;message_subject=Hello;message_subject_mode=random;subject_client_id=false")
+	t.Setenv("SS_PLUGIN_OPTIONS", "imap_host=imap.example.com:993;imap_username=u;imap_password=p;folder_send=c2s;folder_recv=s2c;message_from=sender@example.com;encryption_passphrase=secret;client_encryption_passphrases=7:seven,8:eight;client_id=7;client_version=test-build;message_subject=Hello;message_subject_mode=random;message_to=receiver+{random}@example.com;subject_client_id=false")
 
 	cfg, err := loadSIP003Config()
 	if err != nil {
@@ -83,6 +83,9 @@ func TestLoadSIP003ConfigClient(t *testing.T) {
 	if cfg.MessageSubject != "Hello" || cfg.EffectiveMessageSubjectMode() != config.MessageSubjectModeRandom {
 		t.Fatalf("message subject config = %q/%q", cfg.MessageSubject, cfg.EffectiveMessageSubjectMode())
 	}
+	if cfg.MessageTo != "receiver+{random}@example.com" {
+		t.Fatalf("message to config = %q", cfg.MessageTo)
+	}
 	if cfg.SubjectClientID == nil || cfg.SubjectClientIDEnabled() {
 		t.Fatalf("subject_client_id = %v, want false", cfg.SubjectClientID)
 	}
@@ -92,7 +95,7 @@ func TestLoadSIP003ConfigClient(t *testing.T) {
 	if cfg.StatusAddr != diag.DefaultAndroidAddr {
 		t.Fatalf("status_addr = %q, want %q", cfg.StatusAddr, diag.DefaultAndroidAddr)
 	}
-	if len(cfg.Accounts) != 1 || cfg.Accounts[0].FolderSend != "c2s" {
+	if len(cfg.Accounts) != 1 || cfg.Accounts[0].FolderSend != "c2s" || cfg.Accounts[0].MessageFrom != "sender@example.com" {
 		t.Fatalf("account = %+v", cfg.Accounts)
 	}
 }

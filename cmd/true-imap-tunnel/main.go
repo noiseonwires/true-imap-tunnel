@@ -189,6 +189,7 @@ func main() {
 		if cfg.EffectiveMessageSubjectMode() == config.MessageSubjectModeFixed {
 			fmt.Printf("message_subject: %q\n", cfg.EffectiveMessageSubject())
 		}
+		fmt.Printf("message_to: %q\n", cfg.EffectiveMessageTo())
 		fmt.Printf("subject_client_id: %t\n", cfg.SubjectClientIDEnabled())
 		fmt.Printf("client_version: %s\n", cfg.ClientVersion)
 		if diag.Disabled(cfg.StatusAddr) {
@@ -221,8 +222,8 @@ func main() {
 			if a.UseOAuth2() {
 				auth = "oauth2"
 			}
-			fmt.Printf("  [%d] %s host=%s user=%s tls=%s auth=%s send=%q recv=%q\n",
-				i+1, a.Label(), a.Host, a.Username, a.TLS, auth, a.FolderSend, a.FolderRecv)
+			fmt.Printf("  [%d] %s host=%s user=%s tls=%s auth=%s send=%q recv=%q from=%q\n",
+				i+1, a.Label(), a.Host, a.Username, a.TLS, auth, a.FolderSend, a.FolderRecv, a.EffectiveMessageFrom())
 		}
 		fmt.Printf("batch: max_frames=%d max_bytes=%d queue=%d delay=%v\n",
 			cfg.BatchMaxFrames(), cfg.BatchMaxBytes(), cfg.BatchQueueSize(), cfg.BatchDelay())
@@ -372,6 +373,7 @@ func loadSIP003Config() (*config.Config, error) {
 		AttachmentFilename:          opts["attachment_filename"],
 		MessageSubject:              opts["message_subject"],
 		MessageSubjectMode:          config.MessageSubjectMode(optionString(opts, "message_subject_mode", string(config.MessageSubjectModeFixed))),
+		MessageTo:                   opts["message_to"],
 		SubjectClientID:             subjectClientID,
 		MultipathMode:               config.MultipathMode(optionString(opts, "multipath_mode", string(config.MultipathModeStreamAffinity))),
 		EncryptionPassphrase:        opts["encryption_passphrase"],
@@ -468,7 +470,7 @@ func parseSIP003Accounts(opts map[string]string) []config.AccountConfig {
 	fields := []string{
 		"name", "imap_host", "imap_username", "imap_password",
 		"oauth2_token", "oauth2_token_command", "imap_tls", "imap_insecure_skip_verify",
-		"folder_send", "folder_recv",
+		"folder_send", "folder_recv", "message_from",
 	}
 	var accounts []config.AccountConfig
 	for idx := 0; ; idx++ {
@@ -494,6 +496,7 @@ func parseSIP003Accounts(opts map[string]string) []config.AccountConfig {
 			InsecureSkipVerify: accountOptionBool(opts, "imap_insecure_skip_verify", idx, false),
 			FolderSend:         accountOptionString(opts, "folder_send", idx, ""),
 			FolderRecv:         accountOptionString(opts, "folder_recv", idx, ""),
+			MessageFrom:        accountOptionString(opts, "message_from", idx, ""),
 		})
 	}
 	return accounts
@@ -675,6 +678,7 @@ type ssURLYAMLAccount struct {
 	InsecureSkipVerify bool   `yaml:"insecure_skip_verify,omitempty"`
 	FolderSend         string `yaml:"folder_send"`
 	FolderRecv         string `yaml:"folder_recv"`
+	MessageFrom        string `yaml:"message_from,omitempty"`
 }
 
 type ssURLYAMLConfigDoc struct {
@@ -704,6 +708,7 @@ type ssURLYAMLConfigDoc struct {
 	AttachmentFilename          string                          `yaml:"attachment_filename,omitempty"`
 	MessageSubject              string                          `yaml:"message_subject,omitempty"`
 	MessageSubjectMode          config.MessageSubjectMode       `yaml:"message_subject_mode,omitempty"`
+	MessageTo                   string                          `yaml:"message_to,omitempty"`
 	SubjectClientID             *bool                           `yaml:"subject_client_id,omitempty"`
 	EncryptionPassphrase        string                          `yaml:"encryption_passphrase,omitempty"`
 	ClientEncryptionPassphrases map[byte]string                 `yaml:"client_encryption_passphrases,omitempty"`
@@ -738,6 +743,9 @@ func compactYAMLConfig(cfg *config.Config) ([]byte, error) {
 			InsecureSkipVerify: account.InsecureSkipVerify,
 			FolderSend:         account.FolderSend,
 			FolderRecv:         account.FolderRecv,
+		}
+		if account.MessageFrom != "" && account.EffectiveMessageFrom() != config.DefaultMessageFrom {
+			out.MessageFrom = account.EffectiveMessageFrom()
 		}
 		if account.TLS != "" && account.TLS != "implicit" {
 			out.TLS = account.TLS
@@ -810,6 +818,9 @@ func compactYAMLConfig(cfg *config.Config) ([]byte, error) {
 	}
 	if cfg.EffectiveMessageSubjectMode() != config.MessageSubjectModeFixed {
 		doc.MessageSubjectMode = cfg.EffectiveMessageSubjectMode()
+	}
+	if cfg.MessageTo != "" && cfg.EffectiveMessageTo() != config.DefaultMessageTo {
+		doc.MessageTo = cfg.EffectiveMessageTo()
 	}
 	if cfg.SubjectClientID != nil && !cfg.SubjectClientIDEnabled() {
 		v := false
@@ -924,6 +935,7 @@ func ssURLQueryOptions(cfg *config.Config, skipDefaults bool) (string, error) {
 	addString("attachment_filename", cfg.AttachmentFilename, "tunnel.bin")
 	addString("message_subject", cfg.MessageSubject, config.DefaultMessageSubject)
 	addString("message_subject_mode", string(cfg.EffectiveMessageSubjectMode()), string(config.MessageSubjectModeFixed))
+	addString("message_to", cfg.MessageTo, config.DefaultMessageTo)
 	if !skipDefaults || !cfg.SubjectClientIDEnabled() {
 		addBool("subject_client_id", cfg.SubjectClientIDEnabled(), true)
 	}
@@ -981,6 +993,7 @@ func ssURLQueryOptions(cfg *config.Config, skipDefaults bool) (string, error) {
 		}
 		addAccountOption("folder_send", account.FolderSend, "")
 		addAccountOption("folder_recv", account.FolderRecv, "")
+		addAccountOption("message_from", account.MessageFrom, config.DefaultMessageFrom)
 	}
 	parts := make([]string, 0, len(pairs))
 	for _, pair := range pairs {

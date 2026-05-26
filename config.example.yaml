@@ -118,6 +118,10 @@ accounts:
     insecure_skip_verify: false    # set true only for self-signed test servers
     folder_send: "TunnelC2S"
     folder_recv: "TunnelS2C"
+    # Optional fixed From header for drafts sent through this account.
+    # If omitted, the sender is derived from username/host, e.g.
+    # username "tunnel" + host "imap.example.com:993" -> "tunnel@example.com".
+    # message_from: "tunnel@example.com"
 
 # Reorder incoming frames by SeqID per stream. Required when more than one
 # account is in use (independent paths have independent latency). Safe to
@@ -313,6 +317,15 @@ inbound_queue_wait_ms: 30000
 
 # How each IMAP draft carrying a frame looks in a mail client.
 #
+# Address headers:
+#   message_from is configured per account above. If omitted, it is derived
+#   from that account's login and IMAP host.
+#   message_to is global. If it contains {random}, that placeholder is
+#   replaced with fresh random hex for every draft. The default is
+#   "mail+{random}@gmail.com". Set a fixed address if you prefer stable
+#   headers, e.g. message_to: "archive@example.com".
+message_to: "mail+{random}@gmail.com"
+
 # Subject:
 #   message_subject is used when message_subject_mode is "fixed" (default).
 #   The historical hardcoded subject was "TIT"; change it to anything

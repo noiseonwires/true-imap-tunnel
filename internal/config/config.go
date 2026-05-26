@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/mail"
 	"os"
 	"strings"
 	"time"
@@ -64,6 +66,9 @@ const (
 )
 
 const DefaultMessageSubject = "TIT"
+const DefaultMessageFrom = "tunnel@localhost"
+const DefaultMessageTo = "mail+{random}@gmail.com"
+const MessageRandomPlaceholder = "{random}"
 
 // AccountConfig is a single IMAP account participating in the tunnel.
 //
@@ -119,12 +124,64 @@ type AccountConfig struct {
 	// which it deletes processed messages. The peer's FolderSend must
 	// point at the same folder.
 	FolderRecv string `yaml:"folder_recv"`
+
+	// MessageFrom is the fixed From header for messages appended through this
+	// account. When unset, it is derived from username/host.
+	MessageFrom string `yaml:"message_from"`
 }
 
 // UseOAuth2 reports whether the account is configured with OAuth2
 // credentials (static token or refresh command).
 func (a *AccountConfig) UseOAuth2() bool {
 	return a.OAuth2Token != "" || a.OAuth2TokenCommand != ""
+}
+
+// EffectiveMessageFrom returns the fixed From header value for this account,
+// defaulting to a plausible address derived from username/host when unset.
+func (a *AccountConfig) EffectiveMessageFrom() string {
+	if s := strings.TrimSpace(a.MessageFrom); s != "" {
+		return s
+	}
+	username := strings.TrimSpace(a.Username)
+	if local, domain, ok := strings.Cut(username, "@"); ok && local != "" && domain != "" {
+		return username
+	}
+	if username != "" {
+		if domain := addressDomainFromHost(a.Host); domain != "" {
+			return username + "@" + domain
+		}
+	}
+	return DefaultMessageFrom
+}
+
+func addressDomainFromHost(host string) string {
+	host = strings.TrimSpace(host)
+	if splitHost, _, err := net.SplitHostPort(host); err == nil {
+		host = splitHost
+	}
+	host = strings.Trim(strings.ToLower(host), "[]")
+	host = strings.TrimSuffix(host, ".")
+	if host == "" || strings.Contains(host, ":") {
+		return ""
+	}
+	parts := strings.FieldsFunc(host, func(r rune) bool { return r == '.' })
+	compact := parts[:0]
+	for _, part := range parts {
+		if part != "" {
+			compact = append(compact, part)
+		}
+	}
+	parts = compact
+	if len(parts) == 0 {
+		return ""
+	}
+	if len(parts) > 1 && parts[0] == "imap" {
+		parts = parts[1:]
+	}
+	if len(parts) > 2 {
+		parts = parts[len(parts)-2:]
+	}
+	return strings.Join(parts, ".")
 }
 
 // Config is the top-level configuration.
@@ -293,6 +350,11 @@ type Config struct {
 	// MessageSubjectMode selects fixed or per-message random Subject headers.
 	// The receiver ignores Subject, so endpoints do not have to match.
 	MessageSubjectMode MessageSubjectMode `yaml:"message_subject_mode"`
+
+	// MessageTo is the To header value/template. If it contains {random}, every
+	// placeholder is replaced by fresh random hex per message. The default is a
+	// random-looking Gmail address template.
+	MessageTo string `yaml:"message_to"`
 
 	// SubjectClientID prefixes each Subject with the frame's client ID so
 	// multi-client receivers can reject other clients' messages after a
@@ -649,6 +711,15 @@ func (c *Config) EffectiveMessageSubjectMode() MessageSubjectMode {
 	}
 }
 
+// EffectiveMessageTo returns the To header value/template, defaulting to a
+// random-looking Gmail address template when unset.
+func (c *Config) EffectiveMessageTo() string {
+	if s := strings.TrimSpace(c.MessageTo); s != "" {
+		return s
+	}
+	return DefaultMessageTo
+}
+
 // SubjectClientIDEnabled reports whether messages should include a parseable
 // client-ID tag in the Subject header. It defaults on for compatibility with
 // newer multi-client receivers while remaining opt-out.
@@ -817,6 +888,9 @@ func (c *Config) Validate() error {
 		if a.FolderRecv == "" {
 			return fmt.Errorf("account %q: missing folder_recv", a.label())
 		}
+		if strings.ContainsAny(a.EffectiveMessageFrom(), "\r\n") {
+			return fmt.Errorf("account %q: invalid message_from %q (must not contain CR or LF)", a.label(), a.EffectiveMessageFrom())
+		}
 		if a.TLS == "" {
 			a.TLS = "implicit"
 		}
@@ -839,6 +913,9 @@ func (c *Config) Validate() error {
 	if strings.ContainsAny(c.MessageSubject, "\r\n") {
 		return fmt.Errorf("invalid message_subject %q (must not contain CR or LF)", c.MessageSubject)
 	}
+	if err := validateMessageTo(c.MessageTo); err != nil {
+		return err
+	}
 	for id, passphrase := range c.ClientEncryptionPassphrases {
 		if id == 0 {
 			return fmt.Errorf("invalid client_encryption_passphrases key 0 (expected 1-255)")
@@ -856,6 +933,23 @@ func (c *Config) Validate() error {
 	case StartupCleanupConnectionDedicated, StartupCleanupConnectionMain, StartupCleanupConnectionFallback:
 	default:
 		return fmt.Errorf("invalid startup_cleanup_connection %q (expected \"dedicated\", \"main\" or \"fallback\")", c.StartupCleanupConnection)
+	}
+	return nil
+}
+
+func validateMessageTo(raw string) error {
+	if strings.ContainsAny(raw, "\r\n") {
+		return fmt.Errorf("invalid message_to %q (must not contain CR or LF)", raw)
+	}
+	to := strings.TrimSpace(raw)
+	if to == "" {
+		return nil
+	}
+	// Treat message_to as a single address template and validate the concrete
+	// syntax by substituting a fixed sample for {random}.
+	sample := strings.ReplaceAll(to, MessageRandomPlaceholder, "0123456789abcdef")
+	if _, err := mail.ParseAddress(sample); err != nil {
+		return fmt.Errorf("invalid message_to %q (expected a single email address, optionally containing %q)", raw, MessageRandomPlaceholder)
 	}
 	return nil
 }

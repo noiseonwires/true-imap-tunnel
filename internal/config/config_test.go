@@ -89,6 +89,12 @@ func TestMessageSubjectDefault(t *testing.T) {
 	if !cfg.SubjectClientIDEnabled() {
 		t.Fatal("SubjectClientIDEnabled() = false, want default true")
 	}
+	if got := cfg.Accounts[0].EffectiveMessageFrom(); got != "u@example.com" {
+		t.Fatalf("EffectiveMessageFrom() = %q, want derived sender", got)
+	}
+	if got := cfg.EffectiveMessageTo(); got != DefaultMessageTo {
+		t.Fatalf("EffectiveMessageTo() = %q, want %q", got, DefaultMessageTo)
+	}
 }
 
 func TestMessageSubjectCustom(t *testing.T) {
@@ -130,6 +136,68 @@ func TestSubjectClientIDDisabled(t *testing.T) {
 	}
 	if cfg.SubjectClientIDEnabled() {
 		t.Fatal("SubjectClientIDEnabled() = true, want false")
+	}
+}
+
+func TestMessageFromCustomPerAccount(t *testing.T) {
+	cfg, err := LoadBytes([]byte("" + `
+mode: client
+listen: "127.0.0.1:1080"
+accounts:
+  - host: "imap.example.com:993"
+    username: "u"
+    password: "p"
+    folder_send: "c2s"
+    folder_recv: "s2c"
+    message_from: "sender@example.com"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Accounts[0].EffectiveMessageFrom(); got != "sender@example.com" {
+		t.Fatalf("EffectiveMessageFrom() = %q, want custom sender", got)
+	}
+}
+
+func TestMessageFromRejectsCRLF(t *testing.T) {
+	if _, err := LoadBytes([]byte("" + `
+mode: client
+listen: "127.0.0.1:1080"
+accounts:
+  - host: "imap.example.com:993"
+    username: "u"
+    password: "p"
+    folder_send: "c2s"
+    folder_recv: "s2c"
+    message_from: "ok\r\nInjected: yes"
+`)); err == nil {
+		t.Fatal("LoadBytes accepted message_from containing CRLF")
+	}
+}
+
+func TestMessageToCustomFixed(t *testing.T) {
+	cfg, err := LoadBytes([]byte("message_to: \"receiver@example.com\"\n" + batchDelayConfigBase))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.EffectiveMessageTo(); got != "receiver@example.com" {
+		t.Fatalf("EffectiveMessageTo() = %q, want custom receiver", got)
+	}
+}
+
+func TestMessageToTemplate(t *testing.T) {
+	cfg, err := LoadBytes([]byte("message_to: \"receiver+{random}@example.com\"\n" + batchDelayConfigBase))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.EffectiveMessageTo(); got != "receiver+{random}@example.com" {
+		t.Fatalf("EffectiveMessageTo() = %q, want template", got)
+	}
+}
+
+func TestMessageToRejectsCRLF(t *testing.T) {
+	if _, err := LoadBytes([]byte("message_to: \"ok\r\nInjected: yes\"\n" + batchDelayConfigBase)); err == nil {
+		t.Fatal("LoadBytes accepted message_to containing CRLF")
 	}
 }
 

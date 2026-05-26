@@ -25,6 +25,12 @@ func TestBuildAndExtractFrameRoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatalf("buildMessage: %v", err)
 			}
+			if !bytes.Contains(msg, []byte("From: tunnel@localhost\r\n")) {
+				t.Errorf("missing default From header")
+			}
+			if !bytes.Contains(msg, []byte("To: mail+")) || !bytes.Contains(msg, []byte("@gmail.com\r\n")) {
+				t.Errorf("missing default randomized To header: %s", msg)
+			}
 			if !bytes.Contains(msg, []byte("Subject: TIT\r\n")) {
 				t.Errorf("missing marker subject")
 			}
@@ -67,6 +73,43 @@ func TestBuildAndExtractFrameRoundTrip(t *testing.T) {
 				t.Errorf("payload mismatch")
 			}
 		})
+	}
+}
+
+func TestBuildMessageCustomFromTo(t *testing.T) {
+	msg, err := buildMessage([]byte("x"), time.Unix(0, 0), MessageOptions{
+		From: "sender@example.com",
+		To:   "receiver@example.com",
+	})
+	if err != nil {
+		t.Fatalf("buildMessage: %v", err)
+	}
+	if !bytes.Contains(msg, []byte("From: sender@example.com\r\n")) {
+		t.Fatalf("custom From missing:\n%s", msg)
+	}
+	if !bytes.Contains(msg, []byte("To: receiver@example.com\r\n")) {
+		t.Fatalf("custom To missing:\n%s", msg)
+	}
+}
+
+func TestBuildMessageRandomToTemplate(t *testing.T) {
+	oldReadRandom := readRandom
+	defer func() { readRandom = oldReadRandom }()
+	readRandom = func(b []byte) (int, error) {
+		for i := range b {
+			b[i] = byte(i)
+		}
+		return len(b), nil
+	}
+
+	msg, err := buildMessage([]byte("x"), time.Unix(0, 0), MessageOptions{
+		To: "notes+{random}@example.com",
+	})
+	if err != nil {
+		t.Fatalf("buildMessage: %v", err)
+	}
+	if !bytes.Contains(msg, []byte("To: notes+0001020304050607@example.com\r\n")) {
+		t.Fatalf("random To missing:\n%s", msg)
 	}
 }
 
@@ -183,6 +226,19 @@ func TestBuildMessageRejectsHeaderInjectionSubject(t *testing.T) {
 		Subject: "safe\r\nInjected: yes",
 	}); err == nil {
 		t.Fatal("buildMessage accepted subject containing CRLF")
+	}
+}
+
+func TestBuildMessageRejectsHeaderInjectionFromTo(t *testing.T) {
+	if _, err := buildMessage([]byte("x"), time.Unix(0, 0), MessageOptions{
+		From: "safe@example.com\r\nInjected: yes",
+	}); err == nil {
+		t.Fatal("buildMessage accepted From containing CRLF")
+	}
+	if _, err := buildMessage([]byte("x"), time.Unix(0, 0), MessageOptions{
+		To: "safe@example.com\r\nInjected: yes",
+	}); err == nil {
+		t.Fatal("buildMessage accepted To containing CRLF")
 	}
 }
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.1
+
+### Added
+
+- Configurable draft address headers:
+  - Per-account `message_from` overrides the generated From header.
+  - `message_to` can be fixed or contain `{random}` for a fresh random-looking To header per draft.
+
 ## v0.3.0
 
 ### Added

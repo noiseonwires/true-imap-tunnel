@@ -219,9 +219,16 @@ notes.
 
 ## Customizing how messages look in the mailbox
 
-Five config knobs let you change how each tunnel draft appears to anyone (or
+Seven config knobs let you change how each tunnel draft appears to anyone (or
 anything) browsing the IMAP folder in a normal mail client:
 
+- `message_from` is an account-level fixed From header override. When omitted,
+  it is derived from that account's login and IMAP host: a username that already
+  looks like an email address is used as-is; otherwise the sender becomes
+  `username@example.com` for hosts like `imap.example.com:993`.
+- `message_to` (default `mail+{random}@gmail.com`) sets the To header. Any
+  `{random}` placeholder is replaced with fresh random hex for every draft. Set
+  it to a normal address without `{random}` if you want a fixed To header.
 - `message_subject` (default `TIT`) sets the fixed Subject header. The subject
   used to be hardcoded as `TIT`; it is now configurable.
 - `message_subject_mode` (`fixed` — default — or `random`) controls Subject

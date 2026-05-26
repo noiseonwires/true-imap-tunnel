@@ -30,6 +30,8 @@ const base64LineLen = 76
 
 const randomSubjectBytes = 16
 
+const randomAddressBytes = 8
+
 const subjectClientIDHexLen = 2
 
 var readRandom = rand.Read
@@ -54,6 +56,13 @@ type MessageOptions struct {
 	// SubjectMode is "fixed" (default) or "random".
 	SubjectMode config.MessageSubjectMode
 
+	// From is the fixed From header. Empty defaults to tunnel@localhost.
+	From string
+
+	// To is the fixed To header, or a template containing {random}. Empty
+	// defaults to a random-looking Gmail address template.
+	To string
+
 	// ClientID is the stream client ID carried in the Subject when
 	// SubjectClientID is true.
 	ClientID byte
@@ -70,6 +79,8 @@ func defaultMessageOptions() MessageOptions {
 		AttachmentFilename: "tunnel.bin",
 		Subject:            config.DefaultMessageSubject,
 		SubjectMode:        config.MessageSubjectModeFixed,
+		From:               config.DefaultMessageFrom,
+		To:                 config.DefaultMessageTo,
 		SubjectClientID:    true,
 	}
 }
@@ -88,6 +99,14 @@ func buildMessage(frame []byte, date time.Time, opts MessageOptions) ([]byte, er
 	if err != nil {
 		return nil, err
 	}
+	from, err := messageHeaderValue("From", opts.From, config.DefaultMessageFrom)
+	if err != nil {
+		return nil, err
+	}
+	to, err := messageTo(opts)
+	if err != nil {
+		return nil, err
+	}
 
 	// Wrapped base64 of the frame.
 	enc := base64.StdEncoding.EncodeToString(frame)
@@ -101,8 +120,12 @@ func buildMessage(frame []byte, date time.Time, opts MessageOptions) ([]byte, er
 	bodyB.WriteString("\r\n")
 
 	var b bytes.Buffer
-	b.WriteString("From: tunnel@localhost\r\n")
-	b.WriteString("To: tunnel@localhost\r\n")
+	b.WriteString("From: ")
+	b.WriteString(from)
+	b.WriteString("\r\n")
+	b.WriteString("To: ")
+	b.WriteString(to)
+	b.WriteString("\r\n")
 	b.WriteString("Subject: ")
 	b.WriteString(subject)
 	b.WriteString("\r\n")
@@ -138,6 +161,32 @@ func buildMessage(frame []byte, date time.Time, opts MessageOptions) ([]byte, er
 	b.WriteString("\r\n")
 	b.Write(bodyB.Bytes())
 	return b.Bytes(), nil
+}
+
+func messageHeaderValue(name, value, defaultValue string) (string, error) {
+	if strings.ContainsAny(value, "\r\n") {
+		return "", fmt.Errorf("invalid message %s %q: must not contain CR or LF", strings.ToLower(name), value)
+	}
+	out := strings.TrimSpace(value)
+	if out == "" {
+		out = defaultValue
+	}
+	return out, nil
+}
+
+func messageTo(opts MessageOptions) (string, error) {
+	to, err := messageHeaderValue("To", opts.To, config.DefaultMessageTo)
+	if err != nil {
+		return "", err
+	}
+	if !strings.Contains(to, config.MessageRandomPlaceholder) {
+		return to, nil
+	}
+	random, err := randomHex(randomAddressBytes)
+	if err != nil {
+		return "", fmt.Errorf("generate random message to: %w", err)
+	}
+	return strings.ReplaceAll(to, config.MessageRandomPlaceholder, random), nil
 }
 
 func messageSubject(opts MessageOptions) (string, error) {
@@ -211,11 +260,19 @@ func hexNibble(c byte) (byte, bool) {
 }
 
 func randomMessageSubject() (string, error) {
-	var b [randomSubjectBytes]byte
-	if _, err := readRandom(b[:]); err != nil {
+	s, err := randomHex(randomSubjectBytes)
+	if err != nil {
 		return "", fmt.Errorf("generate random message subject: %w", err)
 	}
-	return hex.EncodeToString(b[:]), nil
+	return s, nil
+}
+
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := readRandom(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // quoteMIMEParam escapes characters that would break a quoted-string

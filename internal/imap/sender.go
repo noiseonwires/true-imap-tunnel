@@ -404,6 +404,8 @@ func (s *Sender) sendBatch(reqs []*sendReq) {
 		AttachmentFilename: s.cfg.EffectiveAttachmentFilename(),
 		Subject:            s.cfg.EffectiveMessageSubject(),
 		SubjectMode:        s.cfg.EffectiveMessageSubjectMode(),
+		From:               s.acc.EffectiveMessageFrom(),
+		To:                 s.cfg.EffectiveMessageTo(),
 		ClientID:           clientID,
 		SubjectClientID:    s.cfg.SubjectClientIDEnabled(),
 	})
