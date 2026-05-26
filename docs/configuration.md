@@ -167,8 +167,9 @@ graceful_shutdown_ms: 3000
 ```
 
 Authentication can use either `password` or OAuth2/XOAUTH2 fields such as
-`oauth2_token_command`. Gmail and Microsoft 365 usually require XOAUTH2 because
-plain IMAP passwords are disabled there.
+`oauth2_token_command`. Microsoft 365 usually requires XOAUTH2 because plain
+IMAP passwords are disabled there.  See [`docs/oauth.md`](oauth.md) for OAuth and provider authentication
+notes.
 
 ## Things worth tuning
 

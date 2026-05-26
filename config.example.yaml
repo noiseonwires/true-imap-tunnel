@@ -101,8 +101,7 @@ accounts:
     #     most self-hosted servers).
     password: "app-password-1"
 
-    # (b) OAuth2 / XOAUTH2 — REQUIRED for Outlook.com, Office 365 and
-    #     Gmail (those servers reject the legacy LOGIN command).
+    # (b) OAuth2 / XOAUTH2 — REQUIRED for Outlook.com and Office 365 (those servers reject the legacy LOGIN command).
     #     Either supply a static access token (short-lived — only useful
     #     for ad-hoc testing):
     # oauth2_token: "ya29.A0AfH6SM…"

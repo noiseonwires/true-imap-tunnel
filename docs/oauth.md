@@ -53,6 +53,18 @@ python .\tools\outlook_oauth2_token.py --username "user@company.com" --tenant co
 
 Use the same `--tenant` in the YAML `oauth2_token_command`.
 
+## Gmail
+
+Gmail is better kept simple: if you must use it, use a Google app password
+sometimes called a device/app password in the normal `password` field, and make
+sure IMAP is enabled for the mailbox. App passwords require 2-Step Verification
+and may be unavailable on some managed or protected accounts.
+
+Gmail is not a great provider for this tunnel. Its IMAP implementation is very
+slow for the draft-folder traffic pattern used here. In testing, polling with
+`disable_idle: true` was sometimes slightly faster than IDLE, but both modes were
+still slow enough that another IMAP provider is usually a better choice.
+
 ## YAML configuration
 
 Use `oauth2_token_command` instead of `password`. The command is executed on
@@ -127,23 +139,9 @@ Provider-specific values usually differ:
 | Provider | Typical IMAP host | Token scope |
 | --- | --- | --- |
 | Outlook.com / Microsoft 365 | `outlook.office365.com:993` | `https://outlook.office.com/IMAP.AccessAsUser.All` |
-| Gmail | `imap.gmail.com:993` | `https://mail.google.com/` |
 
-For example, a future Gmail helper could be configured like this:
-
-```yaml
-accounts:
-  - name: "gmail"
-    host: "imap.gmail.com:993"
-    username: "user@gmail.com"
-    oauth2_token_command: 'python tools\gmail_oauth2_token.py --username "user@gmail.com" --no-interactive'
-    tls: "implicit"
-    folder_send: "TunnelC2S"
-    folder_recv: "TunnelS2C"
-```
-
-The helper would still only need to print the raw access token. The tunnel does
-not care how the helper obtained it.
+Any helper still only needs to print the raw access token. The tunnel does not
+care how the helper obtained it.
 
 You can also use an external OAuth credential manager instead of writing a new
 helper, for example `oama`, `pizauth`, or `mutt_oauth2.py`, as long as the
