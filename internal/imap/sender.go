@@ -62,6 +62,12 @@ type Sender struct {
 	connects      atomic.Uint64
 	connectedAtNS atomic.Int64
 
+	// throttledUntilNS holds the wall-clock UnixNano until which the
+	// sender is in a throttle cool-down (set when an IMAP error
+	// matches IsThrottleError and ThrottleBackoff > 0). Exposed via
+	// ThrottledUntil() for diagnostics. Reset on successful connect.
+	throttledUntilNS atomic.Int64
+
 	canceled sync.Map // streamID -> time.Time deadline for dropping stale DATA/FIN
 
 	// AsyncErrorHandler is invoked for async DATA requests when their
@@ -117,6 +123,22 @@ func (s *Sender) ConnectedAt() time.Time {
 
 // ConnectCount returns the number of successful IMAP connections.
 func (s *Sender) ConnectCount() uint64 { return s.connects.Load() }
+
+// ThrottledUntil returns the wall-clock time until which the sender is
+// in a throttle cool-down (server returned a rate-limit/quota marker
+// and ThrottleBackoff > 0). Returns the zero Time when not throttled
+// or when the cool-down has already elapsed.
+func (s *Sender) ThrottledUntil() time.Time {
+	ns := s.throttledUntilNS.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	t := time.Unix(0, ns)
+	if time.Now().After(t) {
+		return time.Time{}
+	}
+	return t
+}
 
 // SentCount returns the total number of successful frame APPENDs since
 // startup. A batch of N frames counts as N (not 1) — this is the
@@ -183,6 +205,14 @@ func (s *Sender) connect() error {
 		if next > s.cfg.ReconnectMaxDelay() {
 			next = s.cfg.ReconnectMaxDelay()
 		}
+		if throttle := s.cfg.ThrottleBackoff(); throttle > 0 && IsThrottleError(err) {
+			if next < throttle {
+				next = throttle
+			}
+			s.throttledUntilNS.Store(time.Now().Add(next).UnixNano())
+			tlog.Warnf("sender %s: throttle marker in connect error (%v); backing off for %v",
+				s.acc.Label(), err, next)
+		}
 		s.failDelay = next
 		return err
 	}
@@ -196,6 +226,7 @@ func (s *Sender) connect() error {
 	s.connected.Store(true)
 	s.connects.Add(1)
 	s.connectedAtNS.Store(time.Now().UnixNano())
+	s.throttledUntilNS.Store(0)
 	s.failDelay = s.cfg.ReconnectInitialDelay()
 	tlog.Infof("sender %s: connected to %s", s.acc.Label(), s.acc.Host)
 	return nil
@@ -218,6 +249,14 @@ func (s *Sender) markFailed(err error) {
 	tlog.Warnf("sender %s: send failed: %v", s.acc.Label(), err)
 	s.disconnect()
 	s.lastFail = time.Now()
+	if throttle := s.cfg.ThrottleBackoff(); throttle > 0 && IsThrottleError(err) {
+		if s.failDelay < throttle {
+			s.failDelay = throttle
+		}
+		s.throttledUntilNS.Store(time.Now().Add(s.failDelay).UnixNano())
+		tlog.Warnf("sender %s: throttle marker in APPEND error; next connect deferred for %v",
+			s.acc.Label(), s.failDelay)
+	}
 }
 
 // Run drives the sender's queue-drain loop until ctx is cancelled. It
@@ -244,6 +283,7 @@ func (s *Sender) Run(ctx context.Context) {
 			err := s.connect()
 			s.mu.Unlock()
 			if err != nil {
+				tlog.Warnf("sender %s: connect failed: %v (retrying)", s.acc.Label(), err)
 				retry := time.NewTimer(500 * time.Millisecond)
 				select {
 				case <-ctx.Done():
@@ -502,6 +542,11 @@ func (s *Sender) appendWithRetryLocked(body []byte, opts *imap.AppendOptions) er
 			tlog.Warnf("sender %s: APPEND attempt %d/%d failed: %v",
 				s.acc.Label(), attempt, appendMaxAttempts, err)
 			s.markFailed(err)
+			// On throttle markers, don't burn through the remaining
+			// attempts — the server already told us to back off.
+			if s.cfg.ThrottleBackoff() > 0 && IsThrottleError(err) {
+				return fmt.Errorf("append throttled by server: %w", err)
+			}
 			if attempt < appendMaxAttempts {
 				s.lastFail = time.Time{}
 			}

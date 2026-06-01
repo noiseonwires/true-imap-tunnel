@@ -1,0 +1,111 @@
+# true-imap-tunnel example: "constrained" profile
+#
+# Use this profile when the IMAP provider is known to be picky like fckng Yandex
+#   - servers with strict per-account session limits (typically 4–8)
+#   - servers that throttle APPEND/FETCH rate or impose folder quotas
+#   - the same account is used on BOTH sides of the tunnel (each side
+#     opens 2 IMAP sessions, doubling the concurrent-session pressure)
+#
+# Symptoms that this profile targets:
+#   - "starts well, then opens time out after a few minutes"
+#   - watcher reconnects every few seconds with cryptic errors
+#   - tx counter climbs but rx counter stays low ("send works, recv stalls")
+#   - folders TunnelC2S / TunnelS2C grow without bound
+#
+# The trade-off vs. the default profile is throughput:
+#   - smaller, less-batched APPENDs
+#   - slower polling (no IDLE)
+#   - longer reconnect backoff after errors
+# In return you get sustainable behaviour against picky servers and
+# explicit, much longer "cool-down" periods after rate-limit hits.
+#
+# Mirror these knobs in BOTH client.yaml and server.yaml. Only the
+# mode/listen/target/folders differ between the two sides.
+
+mode: client                  # or "server" on the other side
+listen: "127.0.0.1:2222"
+
+# Show authentication, TLS, connect/reconnect, and throttle warnings
+# at the default level.
+log_level: info
+
+accounts:
+  - name: "primary"
+    host: "imap.example.com:993"
+    username: "tunnel@example.com"
+    password: "app-password"
+    tls: "implicit"
+    folder_send: "TunnelC2S"   # swap with folder_recv on the server side
+    folder_recv: "TunnelS2C"
+
+# Force NOOP polling instead of IDLE. Many constrained servers have
+# unreliable IDLE under concurrent same-account load (Yandex is the
+# canonical example): they accept IDLE, never send EXISTS, and never
+# respond to DONE, wedging the receive loop until the IDLE deadline
+# fires. Polling avoids that whole class of bugs.
+disable_idle: true
+
+# Slightly slower polling than the default 3s. Combined with the
+# active-poll burst, end-to-end latency for interactive workloads
+# (SSH, web) stays under ~1s while the steady-state IMAP load is low.
+poll_interval_ms: 5000
+active_poll_interval_ms: 500
+active_poll_duration_ms: 10000
+
+# Reconnect backoff: start higher and grow further before capping, so
+# we don't hammer a tired server. The default 500ms → 30s ramp is too
+# aggressive for free-tier providers.
+reconnect_initial_delay_ms: 2000
+reconnect_max_delay_ms: 120000
+reconnect_backoff: 1.7
+
+# Throttle-aware backoff. When the server returns an error containing
+# OVERQUOTA, TOOMANY, INUSE, LIMIT, [TRYAGAIN], BYE, "rate limit",
+# "throttle", or similar, the sender/watcher jumps directly to this
+# floor instead of climbing the normal exponential ramp. The standard
+# ramp caps at reconnect_max_delay_ms; this floor is NOT capped, so it
+# is the right place to set a real cool-down period.
+#
+# Trade-off: while the cool-down is active, THAT account's direction
+# is paused. With a single account that means no traffic in/out for
+# this many ms. The point is that the server already told us "go
+# away" — retrying inside its lockout window typically extends it,
+# so a clean pause recovers faster than repeated retries.
+#
+# 60000 (1 min) is a safe starting point and clears most per-minute
+# rate limits. Raise to 300000 (5 min) for servers that impose
+# session/quota lockouts measured in minutes. 0 disables the feature
+# entirely (normal exponential backoff capped by reconnect_max_delay_ms
+# applies instead).
+throttle_backoff_ms: 60000
+
+# Smaller batches. The default 64 frames / 256 KiB per APPEND is great
+# for fast servers but on constrained ones it makes a single APPEND
+# large enough to (a) exceed per-message size limits and (b) take long
+# enough that other queued frames pile up. 16 frames keeps each APPEND
+# small and predictable.
+batch_max_frames: 16
+batch_max_kb: 64
+batch_queue_size: 256
+batch_delay_ms: 5
+async_data_send: true
+
+# EXPUNGE more often. Constrained servers often impose per-folder
+# message count or quota limits; lazy expunge (default flush at 16
+# deleted UIDs or 30s) lets the folder grow until FETCHing it gets
+# slow. Flush every 4 UIDs or 10 seconds to keep the folder small.
+lazy_expunge_threshold: 4
+lazy_expunge_max_age_ms: 10000
+
+# Smaller UID-consistency window. The default 256 means each cycle's
+# FETCH covers 256+ UIDs. On a slow server that re-fetch is expensive
+# and rarely needed (Yandex/Mail.ru don't reorder UIDs across sessions).
+fetch_uid_overlap: 64
+
+# Stricter open-timeout — a server that needs >15s to deliver OPEN_OK
+# is usually broken in some other way; fail fast and reconnect.
+open_timeout_sec: 15
+
+# Plus all the usual encryption / message-format / etc options. The
+# defaults are fine for them on constrained servers.
+encryption_passphrase: "correct horse battery staple"

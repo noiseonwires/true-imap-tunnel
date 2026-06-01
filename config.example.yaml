@@ -147,6 +147,26 @@ reconnect_initial_delay_ms: 500
 reconnect_max_delay_ms: 30000
 reconnect_backoff: 1.5
 
+# Throttle-aware backoff. When the server returns an error containing
+# OVERQUOTA, TOOMANY, INUSE, LIMIT, [TRYAGAIN], BYE, "rate limit",
+# "throttle", "unavailable", "server busy", or similar, the
+# sender/watcher jumps directly to this floor instead of climbing
+# the normal exponential ramp. The standard ramp is capped by
+# reconnect_max_delay_ms (default 30s), which is too short for a
+# rate-limited provider — every reconnect inside the cool-down window
+# typically extends the lockout.
+#
+# Trade-off: while the cool-down is active, the affected account's
+# direction is paused. With a single account that means no traffic
+# in/out for this many ms. The point is that the server already told
+# us "go away" — pausing recovers faster than repeated retries that
+# extend the lockout.
+#
+# Default 0 (disabled). 60000 (1 min) for typical free-tier providers,
+# 300000 (5 min) for servers with longer session/quota lockouts. See
+# constrained.example.yaml for a full profile.
+throttle_backoff_ms: 0
+
 # Polling fallback for IMAP servers that don't advertise IDLE (RFC 2177)
 # — notably seznam.cz. The fallback cycle sends NOOP to refresh selected
 # mailbox state, then runs FETCH lastUID+1:* and reacts to whatever is there.
@@ -158,11 +178,20 @@ reconnect_backoff: 1.5
 #   - active_poll_interval_ms:    used right after this side sent
 #                                 something, or right after the previous
 #                                 poll returned new frames
-# Active mode lasts for active_poll_duration_ms after the last activity.
+# Active mode lasts for active_poll_duration_ms after the last activity. Even
+# when IDLE is enabled, the watcher closes/reissues IDLE on this cadence so
+# provider-side IDLE time limits and missed EXISTS notifications cannot stall
+# the tunnel indefinitely.
 disable_idle: false
 poll_interval_ms: 3000
 active_poll_interval_ms: 100
 active_poll_duration_ms: 5000
+
+# UID consistency repair window. Some IMAP providers can make APPENDed messages
+# visible to another IMAP session out of UID order. The watcher therefore
+# rechecks this many recently-seen UIDs and only fetches bodies for messages
+# that are not already marked \Deleted. Default: 256. Set 0 to disable.
+fetch_uid_overlap: 256
 
 # Lazy EXPUNGE: don't flush deleted messages on every cycle (each EXPUNGE
 # is one IMAP round-trip; on slow paths that dominates interactive
