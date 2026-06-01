@@ -124,11 +124,21 @@ class MainActivity : Activity() {
                 sb.append("  send: ").append(if (a.optBoolean("sender_connected")) "up" else "down")
                     .append(", tx=").append(a.optLong("sent_frames"))
                     .append(", batches=").append(a.optLong("append_batches"))
+                    .append(", connects=").append(a.optLong("sender_connect_count"))
                     .append('\n')
+                val senderThrottle = a.optLong("sender_throttled_for_ms")
+                if (senderThrottle > 0) {
+                    sb.append("    THROTTLED ").append(senderThrottle).append("ms remaining\n")
+                }
                 sb.append("  recv: ").append(if (a.optBoolean("watcher_connected")) "up" else "down")
                     .append(", ready=").append(a.optBoolean("receive_ready"))
                     .append(", rx=").append(a.optLong("frames_received"))
+                    .append(", connects=").append(a.optLong("watcher_connect_count"))
                     .append('\n')
+                val watcherThrottle = a.optLong("watcher_throttled_for_ms")
+                if (watcherThrottle > 0) {
+                    sb.append("    THROTTLED ").append(watcherThrottle).append("ms remaining\n")
+                }
                 if (a.has("idle_supported")) {
                     sb.append("  idle: ").append(a.optBoolean("idle_supported")).append('\n')
                 }

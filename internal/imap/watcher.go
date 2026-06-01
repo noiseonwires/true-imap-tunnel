@@ -68,6 +68,16 @@ type Watcher struct {
 	client  *imapclient.Client
 	lastUID imap.UID
 
+	// uidValidity/uidBaselineSet track whether lastUID is a live cursor for
+	// the currently selected mailbox generation. On reconnect with the same
+	// UIDVALIDITY we preserve lastUID so messages that arrived while the
+	// watcher was disconnected are still fetched. liveUIDFloor prevents the
+	// consistency repair scan from reaching back into the pre-startup stale
+	// snapshot.
+	uidValidity    uint32
+	uidBaselineSet bool
+	liveUIDFloor   imap.UID
+
 	// pendingExpunge accumulates UIDs marked \Deleted that have not
 	// been EXPUNGEd yet. We batch EXPUNGE to avoid paying its
 	// round-trip on every single cycle — for interactive workloads
@@ -109,6 +119,12 @@ type Watcher struct {
 	connects           atomic.Uint64
 	connectedAtNS      atomic.Int64
 	idleSupported      atomic.Int32
+
+	// throttledUntilNS holds the wall-clock UnixNano until which the
+	// watcher is in a throttle cool-down (set when an IMAP error
+	// matches IsThrottleError and ThrottleBackoff > 0). Exposed via
+	// ThrottledUntil() for diagnostics. Reset to 0 on successful run.
+	throttledUntilNS atomic.Int64
 
 	failDelay time.Duration
 }
@@ -180,6 +196,22 @@ func (w *Watcher) ConnectedAt() time.Time {
 // ConnectCount returns the number of successful IMAP connections.
 func (w *Watcher) ConnectCount() uint64 { return w.connects.Load() }
 
+// ThrottledUntil returns the wall-clock time until which the watcher is
+// in a throttle cool-down (server returned a rate-limit/quota marker
+// and ThrottleBackoff > 0). Returns the zero Time when not throttled
+// or when the cool-down has already elapsed.
+func (w *Watcher) ThrottledUntil() time.Time {
+	ns := w.throttledUntilNS.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	t := time.Unix(0, ns)
+	if time.Now().After(t) {
+		return time.Time{}
+	}
+	return t
+}
+
 // IdleSupported reports whether the current watcher connection supports IDLE.
 func (w *Watcher) IdleSupported() (bool, bool) {
 	switch w.idleSupported.Load() {
@@ -223,16 +255,29 @@ func (w *Watcher) Run(ctx context.Context) {
 		err := w.runOnce(ctx)
 		w.receiveReady.Store(false)
 		w.connected.Store(false)
+		throttled := false
 		if err != nil && !errors.Is(err, context.Canceled) {
-			tlog.Warnf("watcher %s: %v (retrying in %v)",
-				w.acc.Label(), err, w.failDelay)
+			if throttle := w.cfg.ThrottleBackoff(); throttle > 0 && IsThrottleError(err) {
+				throttled = true
+				if w.failDelay < throttle {
+					w.failDelay = throttle
+				}
+				w.throttledUntilNS.Store(time.Now().Add(w.failDelay).UnixNano())
+				tlog.Warnf("watcher %s: %v (throttle marker; retrying in %v)",
+					w.acc.Label(), err, w.failDelay)
+			} else {
+				tlog.Warnf("watcher %s: %v (retrying in %v)",
+					w.acc.Label(), err, w.failDelay)
+			}
+		} else {
+			w.throttledUntilNS.Store(0)
 		}
 		// Try to flush any pending lazy expunges on a still-living
 		// connection — best-effort. If the connection is broken the
 		// flush is a no-op and a future best-effort cleanup can finish
 		// the job.
 		if err := w.flushPendingExpunge(); err != nil {
-			tlog.Debugf("watcher %s: expunge flush on exit: %v",
+			tlog.Warnf("watcher %s: expunge flush on exit: %v",
 				w.acc.Label(), err)
 		}
 		// Always tear down before retry.
@@ -254,11 +299,17 @@ func (w *Watcher) Run(ctx context.Context) {
 			return
 		case <-time.After(w.failDelay):
 		}
-		next := time.Duration(float64(w.failDelay) * w.cfg.ReconnectBackoffMultiplier())
-		if next > w.cfg.ReconnectMaxDelay() {
-			next = w.cfg.ReconnectMaxDelay()
+		// When throttled, keep failDelay clamped at the throttle floor
+		// for the next round too — the standard exponential ramp would
+		// be capped by ReconnectMaxDelay (default 30s) and lose the
+		// throttle backoff entirely.
+		if !throttled {
+			next := time.Duration(float64(w.failDelay) * w.cfg.ReconnectBackoffMultiplier())
+			if next > w.cfg.ReconnectMaxDelay() {
+				next = w.cfg.ReconnectMaxDelay()
+			}
+			w.failDelay = next
 		}
-		w.failDelay = next
 	}
 }
 
@@ -295,6 +346,7 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 	w.connected.Store(true)
 	w.connects.Add(1)
 	w.connectedAtNS.Store(time.Now().UnixNano())
+	w.throttledUntilNS.Store(0)
 	w.mu.Unlock()
 
 	if err := ensureMailbox(c, w.acc.FolderRecv); err != nil {
@@ -318,12 +370,26 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 	w.pendingCount = 0
 	w.lastExpunge = time.Time{}
 
-	// New messages will have UID >= UIDNEXT. Note: messages destined for
-	// other clients that we LEFT in the folder may have UID < UIDNEXT,
-	// but they're not ours so we don't need to fetch them anyway.
-	if sel.UIDNext > 0 {
-		w.lastUID = sel.UIDNext - 1
+	// Establish the UID cursor only for the first connection to this mailbox
+	// generation. On reconnect with the same UIDVALIDITY, preserve lastUID:
+	// messages can arrive while the watcher is disconnected, and resetting to
+	// UIDNEXT-1 would silently skip them. Messages destined for other clients
+	// that we LEFT in the folder may have UID < UIDNEXT, but they're not ours.
+	if !w.uidBaselineSet || w.uidValidity != sel.UIDValidity {
+		if w.uidBaselineSet && w.uidValidity != sel.UIDValidity {
+			tlog.Warnf("watcher %s: UIDVALIDITY changed from %d to %d; resetting UID cursor",
+				w.acc.Label(), w.uidValidity, sel.UIDValidity)
+		}
+		if sel.UIDNext > 0 {
+			w.lastUID = sel.UIDNext - 1
+		} else {
+			w.lastUID = 0
+		}
+		w.uidValidity = sel.UIDValidity
+		w.uidBaselineSet = true
+		w.liveUIDFloor = w.lastUID + 1
 	}
+	startupCleanupMaxUID := w.lastUID
 	w.receiveReady.Store(true)
 	// Clean leftover OWNED messages from before this watcher started. By
 	// default this runs on a short-lived extra connection so a large stale
@@ -333,8 +399,8 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 	// The cleanup is intentionally once per Watcher lifecycle only: on IMAP
 	// reconnect, messages in the mailbox may be live traffic that arrived
 	// while the watcher was reconnecting.
-	if !w.startupCleanupDone && sel.NumMessages > 0 && w.lastUID > 0 {
-		w.startStartupCleanup(ctx, c, w.lastUID, sel.UIDValidity, sel.NumMessages)
+	if !w.startupCleanupDone && sel.NumMessages > 0 && startupCleanupMaxUID > 0 {
+		w.startStartupCleanup(ctx, c, startupCleanupMaxUID, sel.UIDValidity, sel.NumMessages)
 	}
 	w.startupCleanupDone = true
 
@@ -407,18 +473,42 @@ func (w *Watcher) waitIdle(ctx context.Context, c *imapclient.Client) error {
 	case <-w.kick:
 	case <-timer.C:
 	case <-ctx.Done():
-		_ = idleCmd.Close()
-		_ = idleCmd.Wait()
+		w.closeIdleWithDeadline(idleCmd)
 		return ctx.Err()
 	}
 
-	if err := idleCmd.Close(); err != nil {
-		return fmt.Errorf("idle close: %w", err)
+	return w.closeIdleWithDeadline(idleCmd)
+}
+
+// idleCloseTimeout bounds how long the watcher waits for the server's
+// tagged response after sending IDLE DONE. Some providers (Yandex under
+// concurrent same-account load is the known offender) accept DONE but
+// never reply, which previously wedged the receive loop indefinitely.
+// On timeout the watcher returns an error so Run() tears the connection
+// down and reconnects.
+const idleCloseTimeout = 10 * time.Second
+
+func (w *Watcher) closeIdleWithDeadline(idleCmd *imapclient.IdleCommand) error {
+	done := make(chan error, 1)
+	go func() {
+		if err := idleCmd.Close(); err != nil {
+			done <- fmt.Errorf("idle close: %w", err)
+			return
+		}
+		if err := idleCmd.Wait(); err != nil {
+			done <- fmt.Errorf("idle wait: %w", err)
+			return
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(idleCloseTimeout):
+		// The goroutine is left blocked on Close/Wait; Run() will
+		// close the underlying client which unblocks it.
+		return fmt.Errorf("idle did not complete within %v (server stuck)", idleCloseTimeout)
 	}
-	if err := idleCmd.Wait(); err != nil {
-		return fmt.Errorf("idle wait: %w", err)
-	}
-	return nil
 }
 
 // waitPoll sleeps for the configured poll interval, issues NOOP to force
@@ -490,6 +580,69 @@ func (w *Watcher) processRange(ctx context.Context, uidSet imap.UIDSet, dispatch
 		return res.maxUID, err
 	}
 	return w.finishProcessRange(c, res, dispatch)
+}
+
+func (w *Watcher) processUndeletedRange(ctx context.Context, uidSet imap.UIDSet, dispatch bool) error {
+	w.mu.Lock()
+	c := w.client
+	w.mu.Unlock()
+	if c == nil {
+		return errors.New("not connected")
+	}
+
+	undeleted, skippedDeleted, err := w.fetchUndeletedUIDs(c, uidSet)
+	if err != nil {
+		return err
+	}
+	if len(undeleted) == 0 {
+		if skippedDeleted > 0 && tlog.Enabled(tlog.LevelTrace) {
+			tlog.Tracef("watcher %s: consistency scan %s skipped %d deleted message(s)",
+				w.acc.Label(), uidSet.String(), skippedDeleted)
+		}
+		return nil
+	}
+	if tlog.Enabled(tlog.LevelTrace) {
+		tlog.Tracef("watcher %s: consistency scan %s candidates=%d skipped_deleted=%d",
+			w.acc.Label(), uidSet.String(), len(undeleted), skippedDeleted)
+	}
+	_, err = w.processRange(ctx, undeleted, dispatch)
+	return err
+}
+
+func (w *Watcher) fetchUndeletedUIDs(c *imapclient.Client, uidSet imap.UIDSet) (imap.UIDSet, int, error) {
+	fetchOpts := &imap.FetchOptions{
+		UID:   true,
+		Flags: true,
+	}
+	fetchCmd := c.Fetch(uidSet, fetchOpts)
+	defer fetchCmd.Close()
+
+	undeleted := imap.UIDSet{}
+	skippedDeleted := 0
+	for {
+		msg := fetchCmd.Next()
+		if msg == nil {
+			break
+		}
+		buf, err := msg.Collect()
+		if err != nil {
+			tlog.Warnf("watcher %s: flag fetch collect failed: %v",
+				w.acc.Label(), err)
+			continue
+		}
+		if buf.UID == 0 {
+			continue
+		}
+		if hasFlag(buf.Flags, imap.FlagDeleted) {
+			skippedDeleted++
+			continue
+		}
+		undeleted.AddNum(buf.UID)
+	}
+	if err := fetchCmd.Close(); err != nil {
+		return undeleted, skippedDeleted, fmt.Errorf("flag fetch close: %w", err)
+	}
+	return undeleted, skippedDeleted, nil
 }
 
 func (w *Watcher) processRangeBySubject(c *imapclient.Client, uidSet imap.UIDSet, dispatch bool) (processResult, error) {
@@ -827,7 +980,34 @@ func (w *Watcher) fetchAndProcess(ctx context.Context) error {
 	if maxUID > w.lastUID {
 		w.lastUID = maxUID
 	}
+	if overlap, ok := w.consistencyOverlapRange(); ok {
+		if err := w.processUndeletedRange(ctx, overlap, true); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (w *Watcher) consistencyOverlapRange() (imap.UIDSet, bool) {
+	overlap := w.cfg.FetchUIDOverlap()
+	if overlap <= 0 || w.lastUID == 0 {
+		return imap.UIDSet{}, false
+	}
+
+	high := w.lastUID
+	low := imap.UID(1)
+	if high >= imap.UID(overlap) {
+		low = high - imap.UID(overlap) + 1
+	}
+	if w.liveUIDFloor > low {
+		low = w.liveUIDFloor
+	}
+	if low > high {
+		return imap.UIDSet{}, false
+	}
+	uidSet := imap.UIDSet{}
+	uidSet.AddRange(low, high)
+	return uidSet, true
 }
 
 func (w *Watcher) startStartupCleanup(ctx context.Context, c *imapclient.Client, maxUID imap.UID, uidValidity uint32, numMessages uint32) {
@@ -1025,6 +1205,15 @@ func framesMatchClientID(frames []protocol.Frame, clientID byte) bool {
 		}
 	}
 	return true
+}
+
+func hasFlag(flags []imap.Flag, want imap.Flag) bool {
+	for _, flag := range flags {
+		if flag == want {
+			return true
+		}
+	}
+	return false
 }
 
 func findBodySectionBytes(sections []imapclient.FetchBodySectionBuffer) []byte {

@@ -85,6 +85,44 @@ func defaultMessageOptions() MessageOptions {
 	}
 }
 
+// throttleMarkers are case-insensitive substrings that, when found in
+// an IMAP server's error text, indicate a rate-limit, quota, session, or
+// "try again later" condition. Hitting these and immediately retrying
+// typically extends the lockout, so the caller should switch to the
+// configured throttle backoff instead of the normal exponential ramp.
+var throttleMarkers = []string{
+	"overquota",
+	"tryagain",
+	"try again",
+	"inuse",
+	"too many",
+	"toomany",
+	"limit exceeded",
+	"rate limit",
+	"throttle",
+	"throttled",
+	"unavailable",
+	"server busy",
+	"bye",
+}
+
+// IsThrottleError reports whether the given error text matches a known
+// server-side rate-limit / quota / session-limit marker. The match is
+// case-insensitive and substring-based — IMAP servers vary wildly in
+// the exact wording, so the list errs on the side of broad coverage.
+func IsThrottleError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	for _, m := range throttleMarkers {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // buildMessage wraps a binary frame in an RFC 5322 message body suitable
 // for APPEND. The output is small and self-contained.
 //

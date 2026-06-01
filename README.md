@@ -1,8 +1,8 @@
-# T.I.T.(S.) - True IMAP Tunnel (secure)
+# True IMAP Tunnel (secure)
 
-<img src="docs/hello.jpg" alt="hello" width="640">
+<img src="docs/hello.webp" alt="hello" width="640">
 
-**T.I.T.(S.)** is a TCP tunnel that hides arbitrary TCP streams inside IMAP draft
+**True IMAP Tunnel (secure)** is a TCP tunnel that hides arbitrary TCP streams inside IMAP draft
 messages. It does **not send emails**: no SMTP, no recipients, no delivery.
 It only logs in to IMAP, writes draft-like messages into private folders, reads
 them from the other side, and deletes them after processing. Your mail server becomes the world's least suspicious packet queue.
@@ -50,9 +50,11 @@ receiver SELECTs its receive folder, waits with IMAP `IDLE` when available,
 FETCHes new drafts, decodes frames, dispatches them to streams, marks handled
 messages `\Deleted`, and EXPUNGEs them later in batches.
 
-Some IMAP servers do not support `IDLE`. T.I.T.(S.) falls back to polling in that
-case, but polling is slower and less reliable than real IDLE delivery. If you
-can choose the mail provider/server, prefer one with solid IMAP IDLE support.
+Some IMAP servers do not support `IDLE`.Tunnel client falls back to polling in that
+case, and even IDLE mode has a bounded safety fetch so provider-side IDLE time
+limits or missed notifications cannot stall the tunnel indefinitely. If you can
+choose the mail provider/server, prefer one with solid IMAP IDLE support and
+ordered cross-session visibility.
 
 Optional `encryption_passphrase` enables AES-256-GCM frame encryption before
 frames are stored in IMAP. Empty passphrase means encryption is disabled.
@@ -60,6 +62,16 @@ frames are stored in IMAP. Empty passphrase means encryption is disabled.
 To change how each tunnel draft looks to anyone browsing the IMAP folder in a
 normal mail client (subject, attachment vs plain-text body, custom filename), see
 [`docs/configuration.md`](docs/configuration.md#customizing-how-messages-look-in-the-mailbox).
+
+## Provider notes (personal experience)
+
+Anecdotal, your mileage may vary:
+
+- **Gmail** — slow, but manageable for everyday use.
+- **Outlook** - same, but requieres OAuth.
+- **Seznam.cz** — no `IDLE` support, works fine with polling still.
+- **Mail.ru** — fast and stable. Best experience so far.
+- **Yandex** — terribly slow and tends to die after a minute. If you know why - PRs are welcome.
 
 ## Build
 
@@ -98,7 +110,7 @@ and use mirrored `folder_send` / `folder_recv` values on both sides.
 
 ## Shadowsocks SIP003 plugin
 
-T.I.T.(S.) can also run as a Shadowsocks SIP003 plugin, including on Shadowsocks
+It can also run as a Shadowsocks SIP003 plugin, including on Shadowsocks
 Android. The plugin-specific setup, Android hints, URL formats, and APK build
 steps live in [`android-plugin/README.md`](android-plugin/README.md).
 
@@ -107,3 +119,5 @@ steps live in [`android-plugin/README.md`](android-plugin/README.md).
 Copyright (C) 2026 [Kirill aka `noiseonwires`](https://github.com/noiseonwires).
 
 GNU Lesser General Public License v3.0 or later. See [`LICENSE`](LICENSE).
+
+And yes, the acronym is intentional.

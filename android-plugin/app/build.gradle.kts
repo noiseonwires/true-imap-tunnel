@@ -5,6 +5,8 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val buildVersion = providers.gradleProperty("buildVersion").orElse("0.4.0").get()
+
 android {
     namespace = "com.trueimaptunnel.plugin"
     compileSdk = 35
@@ -13,8 +15,17 @@ android {
         applicationId = "com.trueimaptunnel.plugin"
         minSdk = 23
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.1.1"
+        versionCode = 4
+        versionName = buildVersion
+    }
+
+    signingConfigs {
+        getByName("debug") {
+            storeFile = rootProject.file("ci-debug.keystore")
+            storePassword = "android"
+            keyAlias = "true-imap-tunnel-ci-debug"
+            keyPassword = "android"
+        }
     }
 
     compileOptions {
@@ -31,7 +42,7 @@ tasks.register<Exec>("buildGoArm64") {
     val repoRoot = rootProject.projectDir.parentFile
     val outDir = project.layout.projectDirectory.dir("src/main/jniLibs/arm64-v8a").asFile
     val outFile = outDir.resolve("libtrueimaptunnel.so")
-    val versionName = android.defaultConfig.versionName ?: "dev"
+    val versionName = buildVersion
 
     doFirst { outDir.mkdirs() }
 

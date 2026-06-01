@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.4.0
+
+### Added
+
+- Added `fetch_uid_overlap` to repair delayed/out-of-order IMAP visibility without reprocessing messages already marked `\Deleted`.
+- Added throttle-aware backoff via `throttle_backoff_ms`, plus `constrained.example.yaml` for picky IMAP providers.
+- Android/status diagnostics now show sender/watcher connect counts and active throttle cool-downs.
+
+### Changed
+
+- Watchers preserve UID cursors across reconnects, and wedged IDLE `DONE` waits now force reconnect instead of stalling receive forever.
+- IMAP connect, throttle, and shutdown-EXPUNGE problems are now visible at normal log levels.
+- CI now produces sideloadable signed debug Android APKs and stamps build metadata from release tags or workflow overrides.
+
 ## v0.3.1
 
 ### Added
@@ -41,7 +55,7 @@
   - Added `docs/oauth.md` with provider-helper guidance.
   - Added an Outlook.com / Microsoft 365 token helper at `tools/outlook_oauth2_token.py`.
 - Android plugin diagnostics UI:
-  - The Shadowsocks Android plugin APK now includes a tiny launcher app - opening **T.I.T.S.** while the SS profile is running shows tunnel/account status and recent logs.
+  - The Shadowsocks Android plugin APK now includes a tiny launcher app - opening **T.I.T.(s.)** while the SS profile is running shows tunnel/account status and recent logs.
 - Local diagnostics HTTP API:
   - `status_addr` enables a local status/log endpoint for standalone or plugin use.
 - IMAP/provider compatibility controls:

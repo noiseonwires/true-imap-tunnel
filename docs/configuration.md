@@ -33,8 +33,8 @@ Example: expose a remote SOCKS5 proxy running on the server host.
 
 1. On the server host, run Dante/Xray/any TCP service locally, e.g.
    `127.0.0.1:1080`.
-2. Run T.I.T.(S.) server mode on that host with `target: "127.0.0.1:1080"`.
-3. Run T.I.T.(S.) client mode on your device/laptop with
+2. Run in server mode on that host with `target: "127.0.0.1:1080"`.
+3. Run in client mode on your device/laptop with
    `listen: "127.0.0.1:1080"`.
 4. Configure your app/browser to use local `127.0.0.1:1080`.
 
@@ -135,10 +135,12 @@ dial_timeout_sec: 10
 reconnect_initial_delay_ms: 500
 reconnect_max_delay_ms: 30000
 reconnect_backoff: 1.5
+throttle_backoff_ms: 0 # 0 disables; >0 = cool-down after rate-limit / quota errors
 poll_interval_ms: 3000 # this is for servers that don't support IDLE
 disable_idle: false # force NOOP+FETCH polling even if IDLE is advertised
 active_poll_interval_ms: 100
 active_poll_duration_ms: 5000
+fetch_uid_overlap: 256 # trailing UID repair window for eventual visibility
 
 lazy_expunge_threshold: 16
 lazy_expunge_max_age_ms: 30000
@@ -189,7 +191,7 @@ notes.
   data, a per-stream overflow drainer waits for queue space instead of blocking
   the shared IMAP watcher or immediately resetting the stream. Lower it only if
   you prefer fast failure over surviving upload stalls.
-- If you tunnel Shadowsocks through T.I.T.(S.), you can usually leave
+- If you tunnel Shadowsocks, you can usually leave
   `encryption_passphrase` empty. Shadowsocks traffic is already encrypted, and
   double-encrypting every tunnel frame only adds CPU work and bytes of overhead.
 - On shared IMAP accounts with multiple tunnel clients, prefer server-side
@@ -207,8 +209,15 @@ notes.
 - `disable_idle: true` forces NOOP+FETCH polling even when the server advertises
   IDLE. Use it for testing or for providers with buggy IDLE support.
 - `poll_interval_ms` matters when IDLE is disabled/missing or during safety
-  fetches. Polling is inherently slower and may feel unreliable compared with
-  IDLE.
+  fetches. Even with IDLE enabled, the watcher periodically closes IDLE and
+  runs a safety fetch so provider-side IDLE limits and missed EXISTS
+  notifications cannot stall the tunnel indefinitely.
+- `fetch_uid_overlap` is the receiver's repair window for IMAP providers with
+  eventual cross-session visibility. If a later UID is observed before an
+  earlier APPEND becomes visible, the watcher rechecks the trailing UID window
+  and fetches only messages not already marked `\Deleted`. Increase it for
+  providers that expose messages very late or under heavy bursts; set `0` only
+  if you know the provider exposes UIDs in strict order.
 - `lazy_expunge_threshold: 1` forces immediate cleanup if your IMAP server has
   strict folder quotas, at the cost of extra IMAP round trips.
 - `startup_cleanup_connection: fallback` is the default: it tries old-message

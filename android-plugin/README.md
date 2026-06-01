@@ -1,4 +1,4 @@
-# T.I.T.(S.) Shadowsocks Android plugin
+# True IMAP Tunnel Shadowsocks Android plugin
 
 This directory contains the Android wrapper that exposes the `true-imap-tunnel`
 Go binary as a SIP003 Shadowsocks native plugin.
@@ -35,7 +35,7 @@ In Shadowsocks Android VPN mode, the app injects the SIP003 option
 through Shadowsocks' `protect_path` socket so its own transport traffic does not
 loop back into the VPN.
 
-The APK also has a tiny launcher app. Open **T.I.T.S.** while the Shadowsocks
+The APK also has a tiny launcher app. Open it while the Shadowsocks
 profile is running to see current tunnel/account status and recent logs. The
 plugin exposes this only on the device loopback address
 `http://127.123.45.67:17680`; set `status_addr=off` in plugin options if you
@@ -94,14 +94,14 @@ Multiple accounts use suffixes: `imap_host_2`, `imap_username_2`,
 `_1`.
 
 `client_id` may be supplied explicitly. On clients such as Shadowsocks Android,
-`SS_REMOTE_PORT` is also exposed to the plugin; T.I.T.(S.) maps that port to a
+`SS_REMOTE_PORT` is also exposed to the plugin; we map that port to a
 client id byte with `port % 256`, with `0` mapped to `255`. This lets multiple
 users share the same YAML profile while still stamping distinct stream IDs.
 
 `zero_rtt_open` defaults to off for SIP003 profiles. You can turn it on, but
 test the profile with your actual app traffic first.
 
-If you are tunneling Shadowsocks through T.I.T.(S.), you can usually leave
+If you are tunneling Shadowsocks, you can usually leave
 `encryption_passphrase` empty. Shadowsocks traffic is already encrypted, and the
 extra tunnel encryption layer only adds CPU work and a few bytes of overhead per
 frame.
@@ -211,6 +211,32 @@ $env:ANDROID_HOME = "$env:LOCALAPPDATA\Android\Sdk"
 gradle -p android-plugin assembleRelease --no-daemon --console=plain
 ```
 
+Release APKs are unsigned unless you configure Android signing. CI publishes the
+signed debug APK (`TITS-shadowsocks-plugin-android-debug.apk`) so downloaded
+artifacts can be sideloaded directly. Debug builds use the checked-in public
+`ci-debug.keystore`, which keeps CI artifact signatures stable across builds.
+If you previously installed a locally signed or older CI-signed plugin, fully
+uninstall `com.trueimaptunnel.plugin` from every Android user/profile before
+installing the new artifact.
+
+To clear all profiles with ADB, list users and uninstall the package for each
+listed ID:
+
+```powershell
+$adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
+& $adb shell pm list users
+& $adb shell pm uninstall --user 0 com.trueimaptunnel.plugin
+& $adb shell pm uninstall --user 10 com.trueimaptunnel.plugin
+```
+
+`Failure [not installed for N]` is fine for profiles where the plugin is already
+absent. After the per-profile uninstall, this check should print no matching
+package:
+
+```powershell
+& $adb shell pm list packages -u | Select-String 'trueimap|true-imap|tits'
+```
+
 The Gradle build runs `scripts/build-android-plugin-binary.ps1` on Windows or
 `scripts/build-android-plugin-binary.sh` elsewhere to compile the Android arm64
 Go binary and stage it as:
@@ -233,6 +259,9 @@ Install to a connected device:
 ```
 
 The Android APK build stamps its `versionName`, git hash, and build date into
-the Go binary. Client Ping frames include that build string after the timestamp,
-and servers log it as `client_version=...`. Set `client_version` manually only
-for custom wrappers or manual builds that need a different label.
+the Go binary. CI passes `versionName` from the release tag, stripping a leading
+`v`, or from the workflow-dispatch build version override. For local builds that
+should report a specific version, pass `-PbuildVersion=0.4.0` to Gradle. Client
+Ping frames include that build string after the timestamp, and servers log it as
+`client_version=...`. Set `client_version` manually only for custom wrappers or
+manual builds that need a different label.

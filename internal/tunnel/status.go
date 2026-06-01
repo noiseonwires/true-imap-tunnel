@@ -20,11 +20,13 @@ type AccountStatus struct {
 	SenderConnected         bool   `json:"sender_connected"`
 	SenderConnectedSeconds  int64  `json:"sender_connected_seconds,omitempty"`
 	SenderConnectCount      uint64 `json:"sender_connect_count"`
+	SenderThrottledForMs    int64  `json:"sender_throttled_for_ms,omitempty"`
 	SentFrames              uint64 `json:"sent_frames"`
 	AppendBatches           uint64 `json:"append_batches"`
 	WatcherConnected        bool   `json:"watcher_connected"`
 	WatcherConnectedSeconds int64  `json:"watcher_connected_seconds,omitempty"`
 	WatcherConnectCount     uint64 `json:"watcher_connect_count"`
+	WatcherThrottledForMs   int64  `json:"watcher_throttled_for_ms,omitempty"`
 	ReceiveReady            bool   `json:"receive_ready"`
 	IdleSupported           *bool  `json:"idle_supported,omitempty"`
 	FramesReceived          uint64 `json:"frames_received"`
@@ -66,6 +68,9 @@ func (m *Multipath) AccountStatuses() []AccountStatus {
 				status.SenderConnectedSeconds = int64(now.Sub(connectedAt).Seconds())
 			}
 		}
+		if throttledUntil := sender.ThrottledUntil(); !throttledUntil.IsZero() {
+			status.SenderThrottledForMs = throttledUntil.Sub(now).Milliseconds()
+		}
 		if i < len(m.watchers) {
 			watcher := m.watchers[i]
 			status.WatcherConnected = watcher.Connected()
@@ -76,6 +81,9 @@ func (m *Multipath) AccountStatuses() []AccountStatus {
 				if connectedAt := watcher.ConnectedAt(); !connectedAt.IsZero() {
 					status.WatcherConnectedSeconds = int64(now.Sub(connectedAt).Seconds())
 				}
+			}
+			if throttledUntil := watcher.ThrottledUntil(); !throttledUntil.IsZero() {
+				status.WatcherThrottledForMs = throttledUntil.Sub(now).Milliseconds()
 			}
 			if idle, known := watcher.IdleSupported(); known {
 				status.IdleSupported = &idle

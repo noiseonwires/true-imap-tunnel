@@ -7,6 +7,11 @@ on:
   pull_request:
     branches: [main, master]
   workflow_dispatch:
+    inputs:
+      build_version:
+        description: 'Optional build version override, for example 0.4.0'
+        required: false
+        type: string
 
 env:
   GO_VERSION: '1.26'
@@ -64,6 +69,25 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+      - name: Resolve build version
+        env:
+          BUILD_VERSION_OVERRIDE: ${{ github.event.inputs.build_version }}
+        run: |
+          set -euo pipefail
+          version="$BUILD_VERSION_OVERRIDE"
+          if [ -z "$version" ]; then
+            if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+              version="${GITHUB_REF_NAME#v}"
+            else
+              version="dev-${GITHUB_SHA::7}"
+            fi
+          fi
+          if [[ "$version" =~ [[:space:]] ]]; then
+            echo "Build version must not contain whitespace: $version" >&2
+            exit 1
+          fi
+          echo "BUILD_VERSION=$version" >> "$GITHUB_ENV"
+          echo "Build version: $version"
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
@@ -73,7 +97,7 @@ jobs:
           mkdir -p dist
           DATE="$(date +%Y%m%d-%H%M%S)"
           HASH="$(git rev-parse --short HEAD)"
-          go build -trimpath -ldflags="-s -w -X main.buildDate=$DATE -X main.buildHash=$HASH" \
+          go build -trimpath -ldflags="-s -w -X main.buildVersion=$BUILD_VERSION -X main.buildDate=$DATE -X main.buildHash=$HASH" \
             -o dist/true-imap-tunnel-${{ matrix.suffix }}${{ matrix.ext }} \
             ./cmd/true-imap-tunnel
       - name: Install 7-Zip
@@ -116,6 +140,25 @@ jobs:
     needs: go-test
     steps:
       - uses: actions/checkout@v4
+      - name: Resolve build version
+        env:
+          BUILD_VERSION_OVERRIDE: ${{ github.event.inputs.build_version }}
+        run: |
+          set -euo pipefail
+          version="$BUILD_VERSION_OVERRIDE"
+          if [ -z "$version" ]; then
+            if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+              version="${GITHUB_REF_NAME#v}"
+            else
+              version="dev-${GITHUB_SHA::7}"
+            fi
+          fi
+          if [[ "$version" =~ [[:space:]] ]]; then
+            echo "Build version must not contain whitespace: $version" >&2
+            exit 1
+          fi
+          echo "BUILD_VERSION=$version" >> "$GITHUB_ENV"
+          echo "Build version: $version"
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -127,18 +170,28 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
-      - name: Build APK
+      - name: Build installable APK
         working-directory: android-plugin
-        run: gradle :app:assembleRelease
+        run: gradle :app:assembleDebug -PbuildVersion="$BUILD_VERSION"
       - name: Collect APK
         run: |
           mkdir -p dist
-          cp android-plugin/app/build/outputs/apk/release/*.apk dist/TITS-shadowsocks-plugin-android.apk
+          cp android-plugin/app/build/outputs/apk/debug/app-debug.apk dist/TITS-shadowsocks-plugin-android-debug.apk
+      - name: Verify APK signature
+        run: |
+          set -euo pipefail
+          apk="dist/TITS-shadowsocks-plugin-android-debug.apk"
+          apksigner="$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)"
+          if ! "$apksigner" verify "$apk" > /tmp/apksigner.log 2>&1; then
+            cat /tmp/apksigner.log
+            exit 1
+          fi
+          echo "APK signature verified: $apk"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: shadowsocks-android-plugin
-          path: dist/TITS-shadowsocks-plugin-android.apk
+          name: shadowsocks-android-plugin-debug
+          path: dist/TITS-shadowsocks-plugin-android-debug.apk
           if-no-files-found: error
 
   release:

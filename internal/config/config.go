@@ -253,6 +253,18 @@ type Config struct {
 	ReconnectMaxDelayMs     int     `yaml:"reconnect_max_delay_ms"`
 	ReconnectBackoff        float64 `yaml:"reconnect_backoff"`
 
+	// ThrottleBackoffMs is the minimum backoff applied after the server
+	// returns a rate-limit, quota, or session-limit error (OVERQUOTA,
+	// TOOMANY, INUSE, LIMIT, [TRYAGAIN], or BYE with throttle wording).
+	// While the cool-down is active, the affected account's direction
+	// pauses; with multipath, other accounts keep working. Retrying
+	// inside the server's lockout typically extends it, so a clean
+	// pause usually recovers faster than repeated retries.
+	//
+	// Default 0 (disabled — normal exponential backoff capped by
+	// ReconnectMaxDelayMs applies). 60000 (1 min) is a safe opt-in;
+	ThrottleBackoffMs int `yaml:"throttle_backoff_ms"`
+
 	// PollIntervalMs is the polling interval (in milliseconds) used when
 	// the IMAP server does not advertise the IDLE capability, or when
 	// DisableIdle is set. It is also the maximum IDLE wait before a safety
@@ -280,6 +292,14 @@ type Config struct {
 	// watcher stays in active-poll mode before reverting to the idle
 	// interval. Default 5000ms.
 	ActivePollDurationMs int `yaml:"active_poll_duration_ms"`
+
+	// FetchUIDOverlap is the number of recently-seen UIDs the watcher
+	// rechecks after each normal fetch. Some IMAP providers do not make
+	// APPENDed messages visible to other sessions in UID order; a later UID
+	// can be observed before an earlier one. Rechecking a small trailing UID
+	// window prevents the high-water cursor from permanently skipping those
+	// delayed messages. Default 256. Set 0 to disable.
+	FetchUIDOverlap_ *int `yaml:"fetch_uid_overlap"`
 
 	// LazyExpungeThreshold is the number of \Deleted-marked UIDs that
 	// must accumulate before the watcher EXPUNGEs them. EXPUNGE costs
@@ -601,6 +621,16 @@ func (c *Config) ReconnectBackoffMultiplier() float64 {
 	return c.ReconnectBackoff
 }
 
+// ThrottleBackoff returns the minimum backoff applied after a
+// server-side rate-limit / quota / session-limit error is detected,
+// or 0 when the feature is disabled.
+func (c *Config) ThrottleBackoff() time.Duration {
+	if c.ThrottleBackoffMs <= 0 {
+		return 0
+	}
+	return time.Duration(c.ThrottleBackoffMs) * time.Millisecond
+}
+
 // PollInterval returns the NOOP poll interval used when IDLE is not
 // supported (idle / no-traffic case).
 func (c *Config) PollInterval() time.Duration {
@@ -626,6 +656,18 @@ func (c *Config) ActivePollDuration() time.Duration {
 		return 5 * time.Second
 	}
 	return time.Duration(c.ActivePollDurationMs) * time.Millisecond
+}
+
+// FetchUIDOverlap returns the trailing UID window rechecked to tolerate
+// providers whose APPEND visibility is not strictly ordered across sessions.
+func (c *Config) FetchUIDOverlap() int {
+	if c.FetchUIDOverlap_ == nil {
+		return 0
+	}
+	if *c.FetchUIDOverlap_ <= 0 {
+		return 0
+	}
+	return *c.FetchUIDOverlap_
 }
 
 // LazyExpungeThreshold returns the pending-deletion count above which

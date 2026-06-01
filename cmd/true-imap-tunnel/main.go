@@ -70,7 +70,7 @@ var (
 	flagSSMethod          = flag.String("ss-method", "", "Shadowsocks method for -show-ss-url")
 	flagSSPassword        = flag.String("ss-password", "", "Shadowsocks password for -show-ss-url")
 	flagSSPluginID        = flag.String("ss-plugin-id", "true-imap-tunnel", "plugin id for -show-ss-url")
-	flagSSTag             = flag.String("ss-tag", "T.I.T.S.", "URL fragment/tag for -show-ss-url")
+	flagSSTag             = flag.String("ss-tag", "T.I.T.(s.)", "URL fragment/tag for -show-ss-url")
 	flagSSURLFormat       = flag.String("ss-url-format", "base64", "plugin options format for -show-ss-url: base64 or query")
 	flagSSURLSkipDefaults = flag.Bool("ss-url-skip-defaults", false, "omit optional config keys with default values from -show-ss-url output")
 	flagShowConfig        = flag.Bool("show-config", false, "print the loaded configuration and exit")
@@ -361,6 +361,7 @@ func loadSIP003Config() (*config.Config, error) {
 		ReconnectInitialDelayMs: optionInt(opts, "reconnect_initial_delay_ms", 0),
 		ReconnectMaxDelayMs:     optionInt(opts, "reconnect_max_delay_ms", 0),
 		ReconnectBackoff:        optionFloat(opts, "reconnect_backoff", 0),
+		ThrottleBackoffMs:       optionInt(opts, "throttle_backoff_ms", 0),
 		PollIntervalMs:          optionInt(opts, "poll_interval_ms", 0),
 		ActivePollIntervalMs:    optionInt(opts, "active_poll_interval_ms", 0),
 		ActivePollDurationMs:    optionInt(opts, "active_poll_duration_ms", 0),
@@ -697,6 +698,7 @@ type ssURLYAMLConfigDoc struct {
 	ReconnectInitialDelayMs     int                             `yaml:"reconnect_initial_delay_ms,omitempty"`
 	ReconnectMaxDelayMs         int                             `yaml:"reconnect_max_delay_ms,omitempty"`
 	ReconnectBackoff            float64                         `yaml:"reconnect_backoff,omitempty"`
+	ThrottleBackoffMs           int                             `yaml:"throttle_backoff_ms,omitempty"`
 	PollIntervalMs              int                             `yaml:"poll_interval_ms,omitempty"`
 	ActivePollIntervalMs        int                             `yaml:"active_poll_interval_ms,omitempty"`
 	ActivePollDurationMs        int                             `yaml:"active_poll_duration_ms,omitempty"`
@@ -785,6 +787,9 @@ func compactYAMLConfig(cfg *config.Config) ([]byte, error) {
 	}
 	if cfg.ReconnectBackoff != 0 && cfg.ReconnectBackoff != 1.5 {
 		doc.ReconnectBackoff = cfg.ReconnectBackoff
+	}
+	if cfg.ThrottleBackoffMs != 0 {
+		doc.ThrottleBackoffMs = cfg.ThrottleBackoffMs
 	}
 	if cfg.PollIntervalMs != 0 && cfg.PollIntervalMs != 3000 {
 		doc.PollIntervalMs = cfg.PollIntervalMs
@@ -921,6 +926,7 @@ func ssURLQueryOptions(cfg *config.Config, skipDefaults bool) (string, error) {
 	if cfg.ReconnectBackoff != 0 && (!skipDefaults || cfg.ReconnectBackoff != 1.5) {
 		add("reconnect_backoff", strconv.FormatFloat(cfg.ReconnectBackoff, 'f', -1, 64))
 	}
+	addInt("throttle_backoff_ms", cfg.ThrottleBackoffMs, 0)
 	addInt("poll_interval_ms", cfg.PollIntervalMs, 3000)
 	addInt("active_poll_interval_ms", cfg.ActivePollIntervalMs, 100)
 	addInt("active_poll_duration_ms", cfg.ActivePollDurationMs, 5000)

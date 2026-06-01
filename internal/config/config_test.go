@@ -36,6 +36,24 @@ func TestBatchDelayExplicitZeroDisables(t *testing.T) {
 	}
 }
 
+func TestFetchUIDOverlapDefaultAndDisable(t *testing.T) {
+	cfg, err := LoadBytes([]byte(batchDelayConfigBase))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.FetchUIDOverlap(); got != 0 {
+		t.Fatalf("FetchUIDOverlap() = %d, want 0", got)
+	}
+
+	cfg, err = LoadBytes([]byte("fetch_uid_overlap: 0\n" + batchDelayConfigBase))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.FetchUIDOverlap(); got != 0 {
+		t.Fatalf("FetchUIDOverlap() = %d, want 0", got)
+	}
+}
+
 func TestStartupCleanupConnectionDefault(t *testing.T) {
 	cfg, err := LoadBytes([]byte(batchDelayConfigBase))
 	if err != nil {
