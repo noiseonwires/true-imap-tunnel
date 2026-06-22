@@ -19,6 +19,10 @@ Some ideas here grew out of my other project,
 [yac-ws-bridge / Bridge To Freedom](https://github.com/noiseonwires/yac-ws-bridge),
 which tunnels traffic over YC serverless functions via WebSockets.
 
+[![Stars](https://img.shields.io/github/stars/noiseonwires/true-imap-tunnel?style=flat&logo=github)](https://github.com/noiseonwires/true-imap-tunnel/stargazers)
+[![Forks](https://img.shields.io/github/forks/noiseonwires/true-imap-tunnel?style=flat&logo=github)](https://github.com/noiseonwires/true-imap-tunnel/network/members)
+[![Last commit](https://img.shields.io/github/last-commit/noiseonwires/true-imap-tunnel?logo=git)](https://github.com/noiseonwires/true-imap-tunnel/commits)
+
 ## How it works
 
 ```text
@@ -67,11 +71,13 @@ normal mail client (subject, attachment vs plain-text body, custom filename), se
 
 Anecdotal, your mileage may vary:
 
-- **Gmail** — slow, but manageable for everyday use.
-- **Outlook** - same, but requieres OAuth.
-- **Seznam.cz** — no `IDLE` support, works fine with polling still.
+- **Gmail** — slooow, but manageable for everyday use.
+- **Outlook** - same, and requires OAuth.
+- **Seznam.cz** — no `IDLE` support, works ok with polling still.
 - **Mail.ru** — fast and stable. Best experience so far.
-- **Yandex** — terribly slow and tends to die after a minute. If you know why - PRs are welcome.
+- **Yandex** — terribly slow and tends to die after a minute (probably ratelimit?). If you know why - PRs are welcome.
+- **Timeweb** - works well, quite fast.
+- **Rambler** - quite fast and relatively stable.
 
 ## Build
 
