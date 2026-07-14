@@ -3,6 +3,7 @@ package imap
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/true-imap-tunnel/true-imap-tunnel/internal/config"
 	"github.com/true-imap-tunnel/true-imap-tunnel/internal/protocol"
@@ -219,9 +220,76 @@ func testSender() *Sender {
 			BatchMaxKB:      1,
 		},
 		queue: make(chan *sendReq, 8),
+		done:  make(chan struct{}),
 	}
 }
 
 func testReq(typ byte, streamID uint32) *sendReq {
 	return &sendReq{frame: protocol.Frame{Type: typ, StreamID: streamID}}
+}
+
+func TestSendAndEnqueueFailFastAfterStop(t *testing.T) {
+	s := testSender()
+	close(s.done) // simulate Run having exited
+
+	f := protocol.Frame{Type: protocol.MsgData, StreamID: protocol.MakeStreamID(1, 1)}
+	if err := s.Send(f); !errors.Is(err, errSenderStopped) {
+		t.Fatalf("Send after stop = %v, want %v", err, errSenderStopped)
+	}
+	if err := s.Enqueue(f); !errors.Is(err, errSenderStopped) {
+		t.Fatalf("Enqueue after stop = %v, want %v", err, errSenderStopped)
+	}
+	if got := len(s.queue); got != 0 {
+		t.Fatalf("queue length = %d, want 0 (nothing enqueued after stop)", got)
+	}
+}
+
+func TestSendReturnsRealReplyNotShutdownError(t *testing.T) {
+	s := testSender()
+	wantErr := errors.New("real append result")
+
+	// Stand-in for Run: take the request, deliver the real reply, then
+	// close done. Send must surface the real reply, never dropping it in
+	// favour of the shutdown error.
+	go func() {
+		req := <-s.queue
+		req.reply <- wantErr
+		close(s.done)
+	}()
+
+	f := protocol.Frame{Type: protocol.MsgData, StreamID: protocol.MakeStreamID(1, 1)}
+	if err := s.Send(f); !errors.Is(err, wantErr) {
+		t.Fatalf("Send = %v, want %v", err, wantErr)
+	}
+}
+
+func TestSweepCanceledEvictsExpiredTombstones(t *testing.T) {
+	s := testSender()
+	now := time.Now()
+
+	// Expired tombstones (deadline already passed) must be evicted.
+	for i := uint32(1); i <= 100; i++ {
+		s.canceled.Store(i, now.Add(-time.Minute))
+	}
+	// Fresh tombstones (deadline in the future) must survive.
+	fresh := map[uint32]bool{}
+	for i := uint32(1000); i < 1005; i++ {
+		s.canceled.Store(i, now.Add(time.Minute))
+		fresh[i] = true
+	}
+
+	s.sweepCanceled(now)
+
+	remaining := 0
+	s.canceled.Range(func(key, _ any) bool {
+		id, _ := key.(uint32)
+		if !fresh[id] {
+			t.Errorf("expired tombstone %v survived sweep", key)
+		}
+		remaining++
+		return true
+	})
+	if remaining != len(fresh) {
+		t.Fatalf("remaining tombstones = %d, want %d", remaining, len(fresh))
+	}
 }

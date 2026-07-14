@@ -70,6 +70,11 @@ type Sender struct {
 
 	canceled sync.Map // streamID -> time.Time deadline for dropping stale DATA/FIN
 
+	// done is closed when Run exits (shutdown). Send/Enqueue select on it
+	// so callers fail fast with errSenderStopped instead of blocking
+	// forever on a queue that no longer has a draining consumer.
+	done chan struct{}
+
 	// AsyncErrorHandler is invoked for async DATA requests when their
 	// eventual APPEND fails. It lets upper layers reset the affected
 	// stream instead of silently dropping bytes and leaving the peer's
@@ -86,7 +91,10 @@ const (
 	streamCancelTTL = 2 * time.Minute
 )
 
-var errStreamCanceled = errors.New("stream canceled")
+var (
+	errStreamCanceled = errors.New("stream canceled")
+	errSenderStopped  = errors.New("sender stopped")
+)
 
 // sendReq is a queued APPEND request from a caller of Send.
 type sendReq struct {
@@ -103,6 +111,7 @@ func NewSender(cfg *config.Config, acc *config.AccountConfig, keys *titcrypto.Ke
 		keys:      keys,
 		queue:     make(chan *sendReq, cfg.BatchQueueSize()),
 		failDelay: cfg.ReconnectInitialDelay(),
+		done:      make(chan struct{}),
 	}
 }
 
@@ -157,8 +166,30 @@ func (s *Sender) BatchCount() uint64 { return s.batchCount.Load() }
 // (shutdown), Send returns the shutdown error.
 func (s *Sender) Send(f protocol.Frame) error {
 	req := &sendReq{frame: f, reply: make(chan error, 1)}
-	s.queue <- req
-	return <-req.reply
+	select {
+	case <-s.done:
+		return errSenderStopped
+	default:
+	}
+	select {
+	case s.queue <- req:
+	case <-s.done:
+		return errSenderStopped
+	}
+	select {
+	case err := <-req.reply:
+		return err
+	case <-s.done:
+		// Run exited while we were waiting. Prefer a real reply if the
+		// batch already completed (drainPendingWithError may have
+		// answered us), otherwise report the shutdown.
+		select {
+		case err := <-req.reply:
+			return err
+		default:
+			return errSenderStopped
+		}
+	}
 }
 
 // Enqueue queues one frame for APPEND and returns once it has entered the
@@ -166,8 +197,17 @@ func (s *Sender) Send(f protocol.Frame) error {
 // Used only for DATA fast-paths where throughput matters more than per-frame
 // synchronous error reporting; queue capacity still provides back-pressure.
 func (s *Sender) Enqueue(f protocol.Frame) error {
-	s.queue <- &sendReq{frame: f}
-	return nil
+	select {
+	case <-s.done:
+		return errSenderStopped
+	default:
+	}
+	select {
+	case s.queue <- &sendReq{frame: f}:
+		return nil
+	case <-s.done:
+		return errSenderStopped
+	}
 }
 
 // CancelStream marks a stream closed so queued async DATA/FIN for it are
@@ -268,6 +308,19 @@ func (s *Sender) markFailed(err error) {
 // Multipath callers that don't want to wait on a disconnected sender
 // should consult Sender.Connected() first.
 func (s *Sender) Run(ctx context.Context) {
+	// Closing done unblocks any Send/Enqueue callers waiting on the queue
+	// once this loop exits (shutdown).
+	defer close(s.done)
+
+	// Periodically evict expired cancellation tombstones so s.canceled
+	// doesn't grow for the process lifetime under high stream churn.
+	sweepDone := make(chan struct{})
+	go func() {
+		defer close(sweepDone)
+		s.sweepCanceledLoop(ctx)
+	}()
+	defer func() { <-sweepDone }()
+
 	// IMAP servers typically time out idle connections at 30 minutes
 	// (RFC 9051 §5.4). NOOP every ~10 minutes is comfortably within that.
 	noop := time.NewTicker(10 * time.Minute)
@@ -519,6 +572,36 @@ func dropAfterCancel(t byte) bool {
 	default:
 		return false
 	}
+}
+
+// sweepCanceledLoop periodically evicts expired cancellation tombstones
+// from s.canceled. Without it, every closed stream leaves a deadline
+// entry that is only ever removed if that same random 24-bit stream ID
+// is processed again — so under sustained churn the map would grow for
+// the process lifetime.
+func (s *Sender) sweepCanceledLoop(ctx context.Context) {
+	ticker := time.NewTicker(streamCancelTTL)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			s.sweepCanceled(now)
+		}
+	}
+}
+
+// sweepCanceled deletes every cancellation tombstone whose deadline is
+// at or before now. Safe to call concurrently with Store/Load/Delete.
+func (s *Sender) sweepCanceled(now time.Time) {
+	s.canceled.Range(func(key, value any) bool {
+		until, ok := value.(time.Time)
+		if !ok || !now.Before(until) {
+			s.canceled.Delete(key)
+		}
+		return true
+	})
 }
 
 func (s *Sender) appendWithRetryLocked(body []byte, opts *imap.AppendOptions) error {

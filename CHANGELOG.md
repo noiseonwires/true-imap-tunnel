@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.1
+
+### Fixed
+
+- Graceful shutdown now owns the work it starts: in-flight target dials are cancelled and waited on, new streams are refused once shutdown begins, and senders fail fast instead of blocking forever on a drained queue.
+- Cancelled-stream tombstones are swept periodically, so sender memory no longer grows for the process lifetime under high stream churn.
+- Watchers no longer advance the UID cursor past a message they failed to fetch, so a transient read error can no longer silently skip frames.
+
 ## v0.4.0
 
 ### Added

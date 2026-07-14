@@ -132,6 +132,27 @@ func TestDispatchPendingDialDataDoesNotSendUnknownRst(t *testing.T) {
 	}
 }
 
+func TestDispatchOpenRejectedDuringShutdown(t *testing.T) {
+	tun, sent := newDispatchTestTunnel()
+	tun.shuttingDown.Store(true)
+
+	streamID := protocol.MakeStreamID(3, 9)
+	tun.dispatchOrdered(protocol.Frame{Type: protocol.MsgOpen, StreamID: streamID}, "acct")
+
+	if len(*sent) != 1 {
+		t.Fatalf("sent %d frames, want 1 OPEN_FAIL: %+v", len(*sent), *sent)
+	}
+	if f := (*sent)[0]; f.Type != protocol.MsgOpenFail || f.StreamID != streamID {
+		t.Fatalf("sent %+v, want OPEN_FAIL for stream %d", f, streamID)
+	}
+	tun.pendingDialsMu.Lock()
+	n := len(tun.pendingDials)
+	tun.pendingDialsMu.Unlock()
+	if n != 0 {
+		t.Fatalf("pendingDials = %d, want 0 (no dial started during shutdown)", n)
+	}
+}
+
 func newDispatchTestTunnel() (*Tunnel, *[]protocol.Frame) {
 	var sent []protocol.Frame
 	tun := &Tunnel{

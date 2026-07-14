@@ -38,6 +38,11 @@ type processResult struct {
 	ownedCount  int
 	skipCount   int
 	fetchedBody int
+	// collectFailed is set when a message body/envelope could not be
+	// Collect()ed. When true, maxUID is held at the last UID actually
+	// read so the caller does not advance the cursor past a frame that
+	// may have been lost.
+	collectFailed bool
 }
 
 // Watcher owns one IMAP connection used exclusively for receiving frames.
@@ -664,9 +669,15 @@ func (w *Watcher) processRangeBySubject(c *imapclient.Client, uidSet imap.UIDSet
 		}
 		buf, err := msg.Collect()
 		if err != nil {
+			// We could not read this message — and we don't even know
+			// its UID. FETCH returns messages in ascending UID order, so
+			// stopping here keeps res.maxUID at the last UID we actually
+			// processed. The failed UID (and everything after it) is then
+			// retried on the next poll cycle instead of being skipped.
 			tlog.Warnf("watcher %s: subject fetch collect failed: %v",
 				w.acc.Label(), err)
-			continue
+			res.collectFailed = true
+			break
 		}
 		if buf.UID == 0 {
 			continue
@@ -702,7 +713,14 @@ func (w *Watcher) processRangeBySubject(c *imapclient.Client, uidSet imap.UIDSet
 	}
 
 	bodyRes, err := w.fetchAndProcessBodies(c, candidates, clientIDHints, dispatch)
-	if bodyRes.maxUID > res.maxUID {
+	if bodyRes.collectFailed {
+		// A body Collect failed; cap the cursor at the last UID the body
+		// fetch actually confirmed. Otherwise a higher subject-only UID
+		// (e.g. one skipped as belonging to another client) could let the
+		// cursor jump past the unread body and never revisit it.
+		res.collectFailed = true
+		res.maxUID = bodyRes.maxUID
+	} else if bodyRes.maxUID > res.maxUID {
 		res.maxUID = bodyRes.maxUID
 	}
 	res.owned.AddSet(bodyRes.owned)
@@ -729,9 +747,15 @@ func (w *Watcher) fetchAndProcessBodies(c *imapclient.Client, uidSet imap.UIDSet
 		}
 		buf, err := msg.Collect()
 		if err != nil {
+			// We could not read this message — and we don't even know
+			// its UID. FETCH returns messages in ascending UID order, so
+			// stopping here keeps res.maxUID at the last UID we actually
+			// processed, letting the failed UID (and everything after it)
+			// be retried on the next poll cycle instead of being skipped.
 			tlog.Warnf("watcher %s: fetch collect failed: %v",
 				w.acc.Label(), err)
-			continue
+			res.collectFailed = true
+			break
 		}
 		if buf.UID == 0 {
 			continue

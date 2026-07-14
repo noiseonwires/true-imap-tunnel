@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/true-imap-tunnel/true-imap-tunnel/internal/config"
@@ -47,6 +48,20 @@ type Tunnel struct {
 	// 0-RTT OPEN work end to end.
 	pendingDialsMu sync.Mutex
 	pendingDials   map[uint32]*pendingDial
+
+	// baseCtx is the tunnel-owned context that parents server-side target
+	// dials. It is cancelled during shutdown so in-flight dials abort
+	// instead of running under context.Background().
+	baseCtx context.Context
+
+	// shuttingDown is set before the graceful-shutdown RST burst so the
+	// dispatch loop stops admitting new server-side OPENs while the
+	// transport is being torn down.
+	shuttingDown atomic.Bool
+
+	// dialWG tracks in-flight server-side dial goroutines so shutdown can
+	// wait for them to release their target sockets.
+	dialWG sync.WaitGroup
 }
 
 // pendingDial is the server-side bookkeeping for an in-flight OPEN.
@@ -196,6 +211,10 @@ func (t *Tunnel) handleAsyncSendError(f protocol.Frame, err error) {
 func (t *Tunnel) Run(ctx context.Context) error {
 	pathsCtx, cancelPaths := context.WithCancel(context.Background())
 	defer cancelPaths()
+	// Server-side target dials are parented to this context so shutdown
+	// cancels any dial still in flight instead of leaking it under
+	// context.Background().
+	t.baseCtx = pathsCtx
 	t.paths.Start(pathsCtx)
 
 	// Client-only: periodic end-to-end RTT probe. Disabled in server
@@ -215,16 +234,28 @@ func (t *Tunnel) Run(ctx context.Context) error {
 	}
 
 	// Graceful shutdown: tell the peer about every still-open stream
-	// before we tear down the transport.
+	// before we tear down the transport. Stop admitting new server-side
+	// OPENs first so no fresh dial starts during the graceful window.
+	t.shuttingDown.Store(true)
 	t.gracefulShutdown()
 
-	// Now stop the multipath and wait for it.
+	// Now stop the multipath and wait for it. Cancelling pathsCtx also
+	// aborts any in-flight target dial (they are parented to it).
 	cancelPaths()
 	t.paths.Wait()
 
 	// Local TCP sockets last — by this point all peer state has been
 	// notified and the transport is gone.
 	t.streams.CloseAll()
+
+	// Finally, wait for server-side dial goroutines to finish releasing
+	// their sockets. Bounded so an unresponsive target can't hang shutdown
+	// (fall back to the dial timeout when the graceful window is disabled).
+	dialWait := t.cfg.GracefulShutdown()
+	if dialWait <= 0 {
+		dialWait = t.cfg.DialTimeout()
+	}
+	t.waitForDials(dialWait)
 	return err
 }
 
@@ -390,6 +421,16 @@ func (t *Tunnel) dispatchOrdered(f protocol.Frame, source string) {
 		// dial in the background. DATA/FIN/RST that arrive before the
 		// dial completes are buffered on the pendingDial.
 		if t.cfg.Mode == config.ModeServer {
+			if t.shuttingDown.Load() {
+				// Transport is tearing down; don't start new dials. Tell
+				// the client so it doesn't wait out its OPEN timeout.
+				_ = t.streams.SendFrame(protocol.Frame{
+					Type:     protocol.MsgOpenFail,
+					StreamID: f.StreamID,
+					Payload:  []byte("server shutting down"),
+				})
+				return
+			}
 			if source != "" {
 				t.paths.PinByLabel(f.StreamID, source)
 			}
@@ -567,6 +608,7 @@ func (t *Tunnel) beginPendingOpen(streamID uint32) {
 	t.pendingDialsMu.Lock()
 	t.pendingDials[streamID] = pd
 	t.pendingDialsMu.Unlock()
+	t.dialWG.Add(1)
 	go t.handleOpen(streamID, pd)
 }
 
@@ -582,6 +624,24 @@ func (t *Tunnel) removePendingDial(streamID uint32) {
 	t.pendingDialsMu.Lock()
 	delete(t.pendingDials, streamID)
 	t.pendingDialsMu.Unlock()
+}
+
+// waitForDials blocks until every in-flight server-side dial goroutine
+// has returned, or until timeout elapses. Called during shutdown after
+// the transport and local sockets are already closed, so outstanding
+// dials should observe cancellation and exit promptly. The wait is
+// always bounded so an unresponsive target can never hang shutdown.
+func (t *Tunnel) waitForDials(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		t.dialWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		tlog.Warnf("shutdown: dial goroutine(s) still in flight after %v", timeout)
+	}
 }
 
 // --- Client mode ---
@@ -799,10 +859,15 @@ func (t *Tunnel) runServer(ctx context.Context) error {
 // stream. There is no window in which a fresh DATA frame can overtake
 // a buffered one.
 func (t *Tunnel) handleOpen(streamID uint32, pd *pendingDial) {
+	defer t.dialWG.Done()
 	defer close(pd.done)
 	defer t.removePendingDial(streamID)
 
-	dialCtx, cancel := context.WithTimeout(context.Background(), t.cfg.DialTimeout())
+	parent := t.baseCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	dialCtx, cancel := context.WithTimeout(parent, t.cfg.DialTimeout())
 	pd.mu.Lock()
 	pd.cancel = cancel
 	earlyRst := pd.rstRecv
@@ -830,6 +895,15 @@ func (t *Tunnel) handleOpen(streamID uint32, pd *pendingDial) {
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
+	}
+
+	// If shutdown began after this dial was launched, don't promote it to
+	// a live stream — close the fresh socket and let the client learn via
+	// its OPEN timeout / our graceful RSTs.
+	if t.shuttingDown.Load() {
+		_ = conn.Close()
+		t.paths.RemoveRoute(streamID)
+		return
 	}
 
 	// Promote the pending dial to a real stream. dispatchOrdered for
