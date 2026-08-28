@@ -1,13 +1,81 @@
 package tunnel
 
 import (
+	"io"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/true-imap-tunnel/true-imap-tunnel/internal/config"
 	"github.com/true-imap-tunnel/true-imap-tunnel/internal/protocol"
 	"github.com/true-imap-tunnel/true-imap-tunnel/internal/streams"
 )
+
+func TestRegisterAndSendOpenHandlesImmediateReplyData(t *testing.T) {
+	streamID := protocol.MakeStreamID(7, 42)
+	banner := []byte("SSH-2.0-test-server\r\n")
+	tun := &Tunnel{
+		cfg:          &config.Config{Mode: config.ModeClient},
+		pendingOpens: make(map[uint32]chan protocol.Frame),
+		pendingDials: make(map[uint32]*pendingDial),
+	}
+
+	var sent []protocol.Frame
+	tun.streams = streams.NewManager(func(f protocol.Frame) error {
+		sent = append(sent, f)
+		if f.Type == protocol.MsgOpen {
+			// Model one watcher fetch containing the OPEN_OK and the target's
+			// immediate SSH banner. Both are dispatched before SendFrame returns.
+			tun.dispatchOrdered(protocol.Frame{
+				Type:     protocol.MsgOpenOK,
+				StreamID: streamID,
+				SeqID:    1,
+			}, "primary")
+			tun.dispatchOrdered(protocol.Frame{
+				Type:     protocol.MsgData,
+				StreamID: streamID,
+				SeqID:    2,
+				Payload:  banner,
+			}, "primary")
+		}
+		return nil
+	})
+
+	responses := make(chan protocol.Frame, 1)
+	tun.pendingOpens[streamID] = responses
+	local, peer := net.Pipe()
+	defer peer.Close()
+
+	s := &streams.Stream{ID: streamID, Conn: local}
+	if err := tun.registerAndSendOpen(s); err != nil {
+		t.Fatalf("register and send OPEN: %v", err)
+	}
+	defer tun.streams.CloseStream(s)
+
+	select {
+	case resp := <-responses:
+		if resp.Type != protocol.MsgOpenOK {
+			t.Fatalf("response type = %s, want OPEN_OK", protocol.TypeName(resp.Type))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for OPEN_OK")
+	}
+
+	got := make([]byte, len(banner))
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := io.ReadFull(peer, got); err != nil {
+		t.Fatalf("read immediate DATA: %v", err)
+	}
+	if string(got) != string(banner) {
+		t.Fatalf("immediate DATA = %q, want %q", got, banner)
+	}
+
+	for _, f := range sent {
+		if f.Type == protocol.MsgRst {
+			t.Fatalf("sent unexpected RST for immediate DATA: %+v", f)
+		}
+	}
+}
 
 func TestDispatchUnknownStreamDataOrFinSendsRst(t *testing.T) {
 	for _, typ := range []byte{protocol.MsgData, protocol.MsgFin} {

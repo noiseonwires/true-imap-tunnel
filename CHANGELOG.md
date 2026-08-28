@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Client streams are now registered before `OPEN` is sent, preventing immediate server-first data (such as an SSH banner arriving with `OPEN_OK`) from being treated as an unknown stream and reset, which could leave subsequent connections hanging.
+
 ## v0.4.1
 
 ### Fixed

@@ -443,14 +443,16 @@ func (t *Tunnel) dispatchOrdered(f protocol.Frame, source string) {
 		// Client-mode only: wake the goroutine that sent OPEN.
 		t.pendingMu.Lock()
 		ch, ok := t.pendingOpens[f.StreamID]
-		t.pendingMu.Unlock()
 		if ok {
-			// Non-blocking — channel is buffered.
+			// Non-blocking — channel is buffered. Keep pendingMu held so
+			// OnRemove cannot close the channel between lookup and send.
 			select {
 			case ch <- f:
 			default:
 			}
-		} else {
+		}
+		t.pendingMu.Unlock()
+		if !ok {
 			tlog.Debugf("%s for unknown stream=%d",
 				protocol.TypeName(f.Type), f.StreamID)
 		}
@@ -718,31 +720,27 @@ func (t *Tunnel) handleAccept(ctx context.Context, conn net.Conn) {
 	}
 	defer cleanupPending()
 
-	if err := t.streams.SendFrame(protocol.Frame{Type: protocol.MsgOpen, StreamID: streamID}); err != nil {
+	s := &streams.Stream{ID: streamID, Conn: conn}
+	if err := t.registerAndSendOpen(s); err != nil {
 		tlog.Warnf("send OPEN failed stream=%d client_id=%d: %v",
 			streamID, protocol.StreamClientID(streamID), err)
-		_ = conn.Close()
-		t.paths.RemoveRoute(streamID)
 		return
 	}
-
-	s := &streams.Stream{ID: streamID, Conn: conn}
 
 	if !zeroRTT {
 		// Classic handshake: block until OPEN_OK/FAIL or timeout.
 		if !t.awaitOpenResponse(ctx, streamID, ch, s) {
+			t.streams.CloseStream(s)
 			return
 		}
-		t.streams.Register(s)
 		t.streams.ReadLoop(s)
 		t.streams.CloseStream(s)
 		return
 	}
 
-	// 0-RTT path: register and start ReadLoop NOW; a background
+	// 0-RTT path: start ReadLoop NOW; a background
 	// goroutine watches the channel and closes the stream if the
 	// server replies OPEN_FAIL.
-	t.streams.Register(s)
 	go func() {
 		select {
 		case resp, ok := <-ch:
@@ -770,6 +768,20 @@ func (t *Tunnel) handleAccept(ctx context.Context, conn net.Conn) {
 	}()
 	t.streams.ReadLoop(s)
 	t.streams.CloseStream(s)
+}
+
+// registerAndSendOpen registers the local stream before transmitting OPEN.
+// The peer can reply with OPEN_OK followed immediately by DATA (for example,
+// an SSH server banner) while SendFrame is still returning. Registering first
+// ensures the watcher can enqueue that DATA instead of treating it as stale
+// traffic for an unknown stream and resetting an otherwise successful open.
+func (t *Tunnel) registerAndSendOpen(s *streams.Stream) error {
+	t.streams.Register(s)
+	if err := t.streams.SendFrame(protocol.Frame{Type: protocol.MsgOpen, StreamID: s.ID}); err != nil {
+		t.streams.CloseStream(s)
+		return err
+	}
+	return nil
 }
 
 func (t *Tunnel) clientTransportReady() bool {
@@ -800,19 +812,16 @@ func (t *Tunnel) waitClientTransportReady(ctx context.Context, timeout time.Dura
 
 // awaitOpenResponse blocks until the server replies OPEN_OK / OPEN_FAIL,
 // the open-timeout fires, or ctx is cancelled. Returns true when the
-// stream is ready to use, false otherwise (and the conn is closed).
+// stream is ready to use. The caller closes the registered stream on false.
 func (t *Tunnel) awaitOpenResponse(ctx context.Context, streamID uint32, ch chan protocol.Frame, s *streams.Stream) bool {
 	select {
 	case resp, ok := <-ch:
 		if !ok {
-			_ = s.Conn.Close()
 			return false
 		}
 		if resp.Type == protocol.MsgOpenFail {
 			tlog.Infof("stream rejected stream=%d client_id=%d reason=%s",
 				streamID, protocol.StreamClientID(streamID), string(resp.Payload))
-			_ = s.Conn.Close()
-			t.paths.RemoveRoute(streamID)
 			return false
 		}
 		tlog.Infof("stream opened stream=%d client_id=%d remote=%s",
@@ -822,11 +831,8 @@ func (t *Tunnel) awaitOpenResponse(ctx context.Context, streamID uint32, ch chan
 		tlog.Warnf("OPEN timeout stream=%d client_id=%d",
 			streamID, protocol.StreamClientID(streamID))
 		_ = t.streams.SendFrame(protocol.Frame{Type: protocol.MsgRst, StreamID: streamID})
-		_ = s.Conn.Close()
-		t.paths.RemoveRoute(streamID)
 		return false
 	case <-ctx.Done():
-		_ = s.Conn.Close()
 		return false
 	}
 }
