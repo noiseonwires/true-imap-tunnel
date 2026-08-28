@@ -1,4 +1,4 @@
-module github.com/true-imap-tunnel/true-imap-tunnel
+module github.com/noiseonwires/true-imap-tunnel
 
 go 1.24.5
 

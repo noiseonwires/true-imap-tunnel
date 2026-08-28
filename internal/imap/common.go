@@ -20,8 +20,8 @@ import (
 
 	"github.com/emersion/go-imap/v2/imapclient"
 
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/config"
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/netprotect"
+	"github.com/noiseonwires/true-imap-tunnel/internal/config"
+	"github.com/noiseonwires/true-imap-tunnel/internal/netprotect"
 )
 
 // base64LineLen is the wrap length used when base64-encoding frame bodies.

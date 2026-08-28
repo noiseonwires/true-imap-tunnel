@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/config"
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/protocol"
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/streams"
+	"github.com/noiseonwires/true-imap-tunnel/internal/config"
+	"github.com/noiseonwires/true-imap-tunnel/internal/protocol"
+	"github.com/noiseonwires/true-imap-tunnel/internal/streams"
 )
 
 func TestRegisterAndSendOpenHandlesImmediateReplyData(t *testing.T) {

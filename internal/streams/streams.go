@@ -31,8 +31,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/protocol"
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/tlog"
+	"github.com/noiseonwires/true-imap-tunnel/internal/protocol"
+	"github.com/noiseonwires/true-imap-tunnel/internal/tlog"
 )
 
 // SendFunc sends an encoded frame to the peer.

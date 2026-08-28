@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/config"
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/protocol"
+	"github.com/noiseonwires/true-imap-tunnel/internal/config"
+	"github.com/noiseonwires/true-imap-tunnel/internal/protocol"
 )
 
 func TestOpportunisticDrainKeepsBatchesClientSpecific(t *testing.T) {

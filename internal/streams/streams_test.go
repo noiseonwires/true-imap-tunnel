@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/protocol"
+	"github.com/noiseonwires/true-imap-tunnel/internal/protocol"
 )
 
 // TestReorderBuffer verifies that frames delivered out of order are

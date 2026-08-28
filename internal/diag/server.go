@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/tlog"
+	"github.com/noiseonwires/true-imap-tunnel/internal/tlog"
 )
 
 const (

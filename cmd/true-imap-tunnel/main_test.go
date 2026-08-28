@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/config"
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/diag"
+	"github.com/noiseonwires/true-imap-tunnel/internal/config"
+	"github.com/noiseonwires/true-imap-tunnel/internal/diag"
 )
 
 func TestParsePluginOptionsEscapes(t *testing.T) {

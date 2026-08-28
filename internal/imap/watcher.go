@@ -11,10 +11,10 @@ import (
 	imap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/config"
-	titcrypto "github.com/true-imap-tunnel/true-imap-tunnel/internal/crypto"
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/protocol"
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/tlog"
+	"github.com/noiseonwires/true-imap-tunnel/internal/config"
+	titcrypto "github.com/noiseonwires/true-imap-tunnel/internal/crypto"
+	"github.com/noiseonwires/true-imap-tunnel/internal/protocol"
+	"github.com/noiseonwires/true-imap-tunnel/internal/tlog"
 )
 
 // FrameHandler is called for each frame decoded from an incoming message.

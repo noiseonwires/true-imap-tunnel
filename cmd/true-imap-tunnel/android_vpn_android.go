@@ -7,8 +7,8 @@ import (
 	"net"
 	"syscall"
 
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/netprotect"
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/tlog"
+	"github.com/noiseonwires/true-imap-tunnel/internal/netprotect"
+	"github.com/noiseonwires/true-imap-tunnel/internal/tlog"
 )
 
 const defaultAndroidProtectPath = "./protect_path"

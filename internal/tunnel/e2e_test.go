@@ -23,9 +23,9 @@ import (
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
 
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/config"
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/protocol"
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/tlog"
+	"github.com/noiseonwires/true-imap-tunnel/internal/config"
+	"github.com/noiseonwires/true-imap-tunnel/internal/protocol"
+	"github.com/noiseonwires/true-imap-tunnel/internal/tlog"
 )
 
 func init() {

@@ -20,11 +20,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/config"
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/diag"
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/netprotect"
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/tlog"
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/tunnel"
+	"github.com/noiseonwires/true-imap-tunnel/internal/config"
+	"github.com/noiseonwires/true-imap-tunnel/internal/diag"
+	"github.com/noiseonwires/true-imap-tunnel/internal/netprotect"
+	"github.com/noiseonwires/true-imap-tunnel/internal/tlog"
+	"github.com/noiseonwires/true-imap-tunnel/internal/tunnel"
 	"gopkg.in/yaml.v3"
 )
 

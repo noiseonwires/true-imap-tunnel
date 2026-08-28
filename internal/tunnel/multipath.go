@@ -10,11 +10,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/config"
-	titcrypto "github.com/true-imap-tunnel/true-imap-tunnel/internal/crypto"
-	imappkg "github.com/true-imap-tunnel/true-imap-tunnel/internal/imap"
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/protocol"
-	"github.com/true-imap-tunnel/true-imap-tunnel/internal/tlog"
+	"github.com/noiseonwires/true-imap-tunnel/internal/config"
+	titcrypto "github.com/noiseonwires/true-imap-tunnel/internal/crypto"
+	imappkg "github.com/noiseonwires/true-imap-tunnel/internal/imap"
+	"github.com/noiseonwires/true-imap-tunnel/internal/protocol"
+	"github.com/noiseonwires/true-imap-tunnel/internal/tlog"
 )
 
 // Multipath owns every IMAP account: one Sender + one Watcher per account.
