@@ -27,6 +27,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -58,8 +59,10 @@ type Stream struct {
 	ID   uint32
 	Conn net.Conn
 
-	mu     sync.Mutex
-	closed bool
+	mu            sync.Mutex
+	closed        bool
+	readFinished  bool
+	writeFinished bool
 
 	// outbound is a small bounded channel of pending writes for this
 	// stream. Populated by HandleData/HandleFin, drained by the
@@ -99,9 +102,10 @@ type outboundEvent struct {
 // Manager tracks active streams and dispatches frames between TCP and the
 // peer transport.
 type Manager struct {
-	mu      sync.Mutex
-	streams map[uint32]*Stream
-	send    SendFunc
+	mu       sync.Mutex
+	streams  map[uint32]*Stream
+	reserved map[uint32]bool
+	send     SendFunc
 
 	// nextID allocates outbound stream IDs. Only the client side allocates
 	// new IDs; the server echoes the ID from each incoming OPEN.
@@ -138,12 +142,15 @@ type Manager struct {
 	// CloseStream / CloseAll) after the stream has been unregistered.
 	// Used by upper layers to clean up per-stream bookkeeping (e.g. the
 	// multipath route table).
-	OnRemove func(streamID uint32)
+	OnRemove  func(streamID uint32)
+	OnClosing func(streamID uint32)
 
 	// OnReorderReset, if set, is invoked when the reorder buffer gives
 	// up on a missing SeqID and resets the stream locally. Upper layers
 	// use this to notify the peer with a real RST so it stops sending.
-	OnReorderReset func(streamID uint32)
+	OnReorderReset  func(streamID uint32)
+	OnDuplicateOpen func(streamID uint32)
+	OnLocalReset    func(streamID uint32)
 
 	// Per-stream send sequence counters (auto-incremented in SendFrame).
 	seqCounters sync.Map // streamID → *atomic.Uint32
@@ -181,6 +188,7 @@ type reorderBuf struct {
 func NewManager(send SendFunc) *Manager {
 	m := &Manager{
 		streams:           make(map[uint32]*Stream),
+		reserved:          make(map[uint32]bool),
 		send:              send,
 		reorderBufs:       make(map[uint32]*reorderBuf),
 		closedReorder:     make(map[uint32]time.Time),
@@ -195,12 +203,53 @@ func NewManager(send SendFunc) *Manager {
 
 // NextID allocates a fresh outbound stream ID. Client side only.
 func (m *Manager) NextID() uint32 {
+	return m.NextIDForClient(0)
+}
+
+func (m *Manager) NextIDForClient(clientID byte) uint32 {
 	for {
-		id := (m.nextID.Add(1) - 1) & protocol.StreamLocalIDMask
-		if id != 0 {
+		localID := (m.nextID.Add(1) - 1) & protocol.StreamLocalIDMask
+		if localID == 0 {
+			continue
+		}
+		id := protocol.MakeStreamID(clientID, localID)
+		m.reorderMu.Lock()
+		m.mu.Lock()
+		available := m.streams[id] == nil && !m.reserved[id] && !time.Now().Before(m.closedReorder[id])
+		if available {
+			m.reserved[id] = true
+		}
+		m.mu.Unlock()
+		m.reorderMu.Unlock()
+		if available {
 			return id
 		}
 	}
+}
+
+func (m *Manager) Retention() time.Duration { return m.reorderTombstoneDuration() }
+
+func (m *Manager) SweepExpired(now time.Time) {
+	m.reorderMu.Lock()
+	defer m.reorderMu.Unlock()
+	for id, until := range m.closedReorder {
+		if !now.Before(until) {
+			delete(m.closedReorder, id)
+		}
+	}
+}
+
+func (m *Manager) ForgetInactive(id uint32) {
+	m.reorderMu.Lock()
+	defer m.reorderMu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.streams[id] != nil || m.reserved[id] {
+		return
+	}
+	delete(m.reorderBufs, id)
+	delete(m.closedReorder, id)
+	m.seqCounters.Delete(id)
 }
 
 func randomInitialStreamID() uint32 {
@@ -243,6 +292,15 @@ func (m *Manager) Register(s *Stream) {
 // in arrival order. Exits on Conn-write error, FIN, or closeCh signal.
 func (m *Manager) runWriter(s *Stream) {
 	defer close(s.writerDone)
+	defer func() {
+		for {
+			select {
+			case <-s.outbound:
+			default:
+				return
+			}
+		}
+	}()
 	for {
 		select {
 		case <-s.closeCh:
@@ -253,7 +311,7 @@ func (m *Manager) runWriter(s *Stream) {
 				if _, err := s.Conn.Write(ev.payload); err != nil {
 					tlog.Warnf("write to TCP failed stream=%d err=%v",
 						s.ID, err)
-					m.CloseStream(s)
+					m.abortStream(s)
 					return
 				}
 			case protocol.MsgFin:
@@ -262,6 +320,7 @@ func (m *Manager) runWriter(s *Stream) {
 				if tc, ok := s.Conn.(*net.TCPConn); ok {
 					_ = tc.CloseWrite()
 				}
+				m.FinishWrite(s)
 				return
 			}
 		}
@@ -277,17 +336,16 @@ func (m *Manager) Get(id uint32) *Stream {
 
 // Remove unregisters a stream and discards its sequencing state.
 func (m *Manager) Remove(id uint32) {
-	if m.Reorder {
-		m.reorderMu.Lock()
-		delete(m.reorderBufs, id)
-		if m.closedReorder == nil {
-			m.closedReorder = make(map[uint32]time.Time)
-		}
-		m.closedReorder[id] = time.Now().Add(m.reorderTombstoneDuration())
-		m.reorderMu.Unlock()
+	m.reorderMu.Lock()
+	delete(m.reorderBufs, id)
+	if m.closedReorder == nil {
+		m.closedReorder = make(map[uint32]time.Time)
 	}
+	m.closedReorder[id] = time.Now().Add(m.reorderTombstoneDuration())
+	m.reorderMu.Unlock()
 	m.mu.Lock()
 	delete(m.streams, id)
+	delete(m.reserved, id)
 	m.mu.Unlock()
 	m.seqCounters.Delete(id)
 	if m.OnRemove != nil {
@@ -299,7 +357,16 @@ func (m *Manager) Remove(id uint32) {
 func (m *Manager) SendFrame(f protocol.Frame) error {
 	if f.StreamID > 0 && protocol.IsOrdered(f.Type) {
 		v, _ := m.seqCounters.LoadOrStore(f.StreamID, &atomic.Uint32{})
-		f.SeqID = v.(*atomic.Uint32).Add(1)
+		counter := v.(*atomic.Uint32)
+		if f.SeqID == 0 {
+			f.SeqID = counter.Add(1)
+		} else {
+			for previous := counter.Load(); previous < f.SeqID; previous = counter.Load() {
+				if counter.CompareAndSwap(previous, f.SeqID) {
+					break
+				}
+			}
+		}
 	}
 	return m.send(f)
 }
@@ -338,10 +405,7 @@ func (m *Manager) HandleData(streamID uint32, payload []byte) {
 // rstSlowStream tears down a stream whose TCP consumer cannot keep up,
 // and notifies the peer so it stops sending data we cannot drain.
 func (m *Manager) rstSlowStream(s *Stream, streamID uint32) {
-	m.CloseStream(s)
-	if m.send != nil {
-		_ = m.send(protocol.Frame{Type: protocol.MsgRst, StreamID: streamID})
-	}
+	m.abortStream(s)
 }
 
 // HandleFin handles a graceful half-close from the peer. Enqueued so it
@@ -417,6 +481,16 @@ func (m *Manager) overflowLimit() int {
 }
 
 func (m *Manager) drainOverflow(s *Stream, streamID uint32, out chan outboundEvent, closeCh chan struct{}) {
+	defer func() {
+		select {
+		case <-closeCh:
+			s.overflowMu.Lock()
+			s.overflow = nil
+			s.overflowDraining = false
+			s.overflowMu.Unlock()
+		default:
+		}
+	}()
 	for {
 		s.overflowMu.Lock()
 		if len(s.overflow) == 0 {
@@ -490,20 +564,62 @@ func (m *Manager) HandleRst(streamID uint32) {
 // CloseStream closes the TCP connection and removes the stream from
 // tracking. Safe to call repeatedly.
 func (m *Manager) CloseStream(s *Stream) {
+	m.closeStream(s)
+}
+
+func (m *Manager) closeStream(s *Stream) bool {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		return
+		return false
 	}
 	s.closed = true
 	closeCh := s.closeCh
 	s.mu.Unlock()
+	if m.OnClosing != nil {
+		m.OnClosing(s.ID)
+	}
 	tlog.Debugf("closing stream=%d", s.ID)
 	if closeCh != nil {
 		close(closeCh)
 	}
 	_ = s.Conn.Close()
+	s.overflowMu.Lock()
+	s.overflow = nil
+	s.overflowMu.Unlock()
 	m.Remove(s.ID)
+	return true
+}
+
+func (m *Manager) FinishWrite(s *Stream) {
+	s.mu.Lock()
+	s.writeFinished = true
+	finished := s.readFinished
+	s.mu.Unlock()
+	if finished {
+		m.CloseStream(s)
+	}
+}
+
+func (m *Manager) finishRead(s *Stream) {
+	s.mu.Lock()
+	s.readFinished = true
+	finished := s.writeFinished
+	s.mu.Unlock()
+	if finished {
+		m.CloseStream(s)
+	}
+}
+
+func (m *Manager) abortStream(s *Stream) {
+	if !m.closeStream(s) {
+		return
+	}
+	if m.OnLocalReset != nil {
+		m.OnLocalReset(s.ID)
+	} else if m.send != nil {
+		_ = m.send(protocol.Frame{Type: protocol.MsgRst, StreamID: s.ID})
+	}
 }
 
 // CloseAll closes every active stream.
@@ -521,16 +637,52 @@ func (m *Manager) CloseAll() {
 	for _, s := range all {
 		m.CloseStream(s)
 	}
+	for _, s := range all {
+		<-s.writerDone
+	}
+	m.mu.Lock()
+	clear(m.reserved)
+	m.mu.Unlock()
 
 	m.seqCounters.Range(func(k, _ any) bool {
 		m.seqCounters.Delete(k)
 		return true
 	})
-	if m.Reorder {
-		m.reorderMu.Lock()
-		m.reorderBufs = make(map[uint32]*reorderBuf)
-		m.reorderMu.Unlock()
+	m.reorderMu.Lock()
+	m.reorderBufs = make(map[uint32]*reorderBuf)
+	clear(m.closedReorder)
+	m.reorderMu.Unlock()
+}
+
+type ReorderGap struct {
+	StreamID      uint32 `json:"stream_id"`
+	ExpectedSeq   uint32 `json:"expected_seq"`
+	PendingFrames int    `json:"pending_frames"`
+	PendingBytes  int64  `json:"pending_bytes"`
+	AgeMs         int64  `json:"age_ms"`
+}
+
+func (m *Manager) ReorderGaps(now time.Time) []ReorderGap {
+	m.reorderMu.Lock()
+	buffers := make(map[uint32]*reorderBuf, len(m.reorderBufs))
+	for id, buffer := range m.reorderBufs {
+		buffers[id] = buffer
 	}
+	m.reorderMu.Unlock()
+	var gaps []ReorderGap
+	for id, buffer := range buffers {
+		buffer.mu.Lock()
+		if len(buffer.pending) > 0 && !buffer.gapSince.IsZero() {
+			gap := ReorderGap{StreamID: id, ExpectedSeq: buffer.expected, PendingFrames: len(buffer.pending), AgeMs: max(0, now.Sub(buffer.gapSince).Milliseconds())}
+			for _, frame := range buffer.pending {
+				gap.PendingBytes += int64(len(frame.Payload))
+			}
+			gaps = append(gaps, gap)
+		}
+		buffer.mu.Unlock()
+	}
+	sort.Slice(gaps, func(left, right int) bool { return gaps[left].StreamID < gaps[right].StreamID })
+	return gaps
 }
 
 // Count returns the number of active streams.
@@ -587,7 +739,9 @@ func (m *Manager) sweepOrphanReorderBufsLocked(now time.Time, idleBudget time.Du
 	}
 	var stale []uint32
 	for id, rb := range m.reorderBufs {
-		rb.mu.Lock()
+		if !rb.mu.TryLock() {
+			continue
+		}
 		lastSeen := rb.lastSeen
 		rb.mu.Unlock()
 		if !lastSeen.IsZero() && now.Sub(lastSeen) <= idleBudget {
@@ -641,11 +795,12 @@ func (m *Manager) DispatchFrame(f protocol.Frame, handler func(protocol.Frame)) 
 	now := time.Now()
 	maxDelay := m.reorderDelay()
 	m.reorderMu.Lock()
-	if f.Type == protocol.MsgOpen && f.SeqID == 1 {
-		delete(m.closedReorder, f.StreamID)
-	} else if until, ok := m.closedReorder[f.StreamID]; ok {
+	if until, ok := m.closedReorder[f.StreamID]; ok {
 		if now.Before(until) {
 			m.reorderMu.Unlock()
+			if f.Type == protocol.MsgOpen && m.OnDuplicateOpen != nil {
+				m.OnDuplicateOpen(f.StreamID)
+			}
 			return
 		}
 		delete(m.closedReorder, f.StreamID)
@@ -673,20 +828,12 @@ func (m *Manager) DispatchFrame(f protocol.Frame, handler func(protocol.Frame)) 
 
 	rb.lastSeen = now
 
-	// An OPEN frame (always seq=1) signals a brand-new stream
-	// lifecycle. If the reorder buffer already has a higher expected
-	// value, the previous stream with this ID ended without a clean
-	// teardown (client crash, network drop, etc.) and the old
-	// expected counter would silently discard every frame from the
-	// new session as "duplicate/old". Reset it.
 	if f.Type == protocol.MsgOpen && f.SeqID == 1 && rb.expected > 1 {
-		tlog.Debugf("reorder: resetting stale buffer stream=%d (was expected=%d)",
-			f.StreamID, rb.expected)
-		rb.expected = 1
-		rb.gapSince = time.Time{}
-		for k := range rb.pending {
-			delete(rb.pending, k)
+		rb.mu.Unlock()
+		if m.OnDuplicateOpen != nil {
+			m.OnDuplicateOpen(f.StreamID)
 		}
+		return
 	}
 
 	if f.SeqID == rb.expected {
@@ -703,6 +850,8 @@ func (m *Manager) DispatchFrame(f protocol.Frame, handler func(protocol.Frame)) 
 		}
 		if len(rb.pending) == 0 {
 			rb.gapSince = time.Time{}
+		} else {
+			rb.gapSince = now
 		}
 	} else if f.SeqID > rb.expected {
 		// Copy the payload — the caller's buffer is short-lived.
@@ -771,15 +920,17 @@ func (m *Manager) ReadLoop(s *Stream) {
 	buf := make([]byte, 32*1024)
 
 	var sentTerm bool
-	sendTerm := func(t byte) {
+	sendTerm := func(kind byte) bool {
 		if sentTerm {
-			return
+			return false
 		}
 		sentTerm = true
-		if err := m.SendFrame(protocol.Frame{Type: t, StreamID: s.ID}); err != nil {
+		if err := m.SendFrame(protocol.Frame{Type: kind, StreamID: s.ID}); err != nil {
 			tlog.Warnf("send %s failed stream=%d err=%v",
-				protocol.TypeName(t), s.ID, err)
+				protocol.TypeName(kind), s.ID, err)
+			return false
 		}
+		return true
 	}
 
 	sendFin := true
@@ -788,7 +939,11 @@ func (m *Manager) ReadLoop(s *Stream) {
 		wasClosed := s.closed
 		s.mu.Unlock()
 		if sendFin && !wasClosed {
-			sendTerm(protocol.MsgFin)
+			if sendTerm(protocol.MsgFin) {
+				m.finishRead(s)
+			} else {
+				m.abortStream(s)
+			}
 		}
 	}()
 
@@ -804,7 +959,7 @@ func (m *Manager) ReadLoop(s *Stream) {
 			}); err2 != nil {
 				tlog.Warnf("send DATA failed stream=%d err=%v", s.ID, err2)
 				sendFin = false
-				sendTerm(protocol.MsgRst)
+				m.abortStream(s)
 				return
 			}
 		}
@@ -816,7 +971,7 @@ func (m *Manager) ReadLoop(s *Stream) {
 				s.mu.Unlock()
 				if !closed {
 					tlog.Warnf("read from TCP failed stream=%d err=%v", s.ID, err)
-					sendTerm(protocol.MsgRst)
+					m.abortStream(s)
 				}
 			}
 			return

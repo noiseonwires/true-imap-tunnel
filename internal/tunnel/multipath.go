@@ -52,8 +52,10 @@ type Multipath struct {
 	// PinByLabel (server side, when an OPEN arrives via a given account).
 	routes sync.Map
 
-	mu sync.Mutex
-	wg sync.WaitGroup
+	mu    sync.Mutex
+	wg    sync.WaitGroup
+	async map[uint32]*asyncSends
+	ctx   context.Context
 
 	OnAsyncSendError func(protocol.Frame, error)
 }
@@ -96,6 +98,7 @@ func NewMultipath(cfg *config.Config, handler imappkg.FrameHandler, filter imapp
 // Start launches every sender and watcher. It returns immediately; the
 // goroutines run until ctx is cancelled.
 func (m *Multipath) Start(ctx context.Context) {
+	m.ctx = ctx
 	for _, s := range m.senders {
 		s := s
 		m.wg.Add(1)
@@ -208,6 +211,11 @@ func (m *Multipath) idleProvenAvailable() bool {
 // Returns ErrNoSenders when no account is configured, or the last error
 // when all attempts failed.
 func (m *Multipath) Send(f protocol.Frame) error {
+	if f.Type == protocol.MsgFin {
+		if err := m.waitData(f.StreamID); err != nil {
+			return err
+		}
+	}
 	if m.cfg.FrameRoundRobinEnabled() && f.Type == protocol.MsgData && f.StreamID != 0 {
 		if err, ok := m.sendFrameRoundRobin(f); ok {
 			return err
@@ -381,10 +389,23 @@ func (m *Multipath) sendFrameRoundRobin(f protocol.Frame) (error, bool) {
 }
 
 func (m *Multipath) sendOn(s *imappkg.Sender, f protocol.Frame) error {
+	ctx := m.context()
 	if m.cfg.AsyncDataSendEnabled() && f.Type == protocol.MsgData {
-		return s.Enqueue(f)
+		complete := m.trackData(f.StreamID)
+		err := s.EnqueueContext(ctx, f, complete)
+		if err != nil {
+			complete(err)
+		}
+		return err
 	}
-	return s.Send(f)
+	return s.SendContext(ctx, f)
+}
+
+func (m *Multipath) context() context.Context {
+	if m.ctx != nil {
+		return m.ctx
+	}
+	return context.Background()
 }
 
 // AllocRoute picks an account for a new stream and records it.
@@ -470,6 +491,62 @@ func (m *Multipath) PinByLabel(streamID uint32, label string) bool {
 // wired to streams.Manager.OnRemove so stale routes don't accumulate.
 func (m *Multipath) RemoveRoute(streamID uint32) {
 	m.routes.Delete(streamID)
+	m.mu.Lock()
+	delete(m.async, streamID)
+	m.mu.Unlock()
+}
+
+type asyncSends struct {
+	pending int
+	done    chan struct{}
+	err     error
+}
+
+func (m *Multipath) trackData(streamID uint32) func(error) {
+	m.mu.Lock()
+	if m.async == nil {
+		m.async = make(map[uint32]*asyncSends)
+	}
+	state := m.async[streamID]
+	if state == nil {
+		state = &asyncSends{}
+		m.async[streamID] = state
+	}
+	if state.pending == 0 {
+		state.done = make(chan struct{})
+	}
+	state.pending++
+	m.mu.Unlock()
+	return func(err error) {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if err != nil && state.err == nil {
+			state.err = err
+		}
+		state.pending--
+		if state.pending == 0 {
+			close(state.done)
+		}
+	}
+}
+
+func (m *Multipath) waitData(streamID uint32) error {
+	m.mu.Lock()
+	state := m.async[streamID]
+	if state == nil {
+		m.mu.Unlock()
+		return nil
+	}
+	done := state.done
+	m.mu.Unlock()
+	select {
+	case <-done:
+	case <-m.context().Done():
+		return m.context().Err()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return state.err
 }
 
 // CancelStream tells every sender to drop queued DATA/FIN for streamID. This is

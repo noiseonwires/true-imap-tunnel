@@ -6,6 +6,7 @@ package tunnel
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +21,7 @@ import (
 	"unsafe"
 
 	imap "github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
 
@@ -43,6 +45,22 @@ func init() {
 // startMemIMAP launches an in-memory IMAP server with one user and the
 // folders our tunnel will use, then returns its address.
 func startMemIMAP(t *testing.T) string {
+	return startMemIMAPWithFault(t, nil)
+}
+
+func startMemIMAPWithFault(t *testing.T, drop *atomic.Bool) string {
+	var hook func(string, net.Conn)
+	if drop != nil {
+		hook = func(mailbox string, conn net.Conn) {
+			if mailbox == "Tunnel.C2S" && drop.CompareAndSwap(false, true) {
+				_ = conn.Close()
+			}
+		}
+	}
+	return startMemIMAPWithAppendHook(t, hook)
+}
+
+func startMemIMAPWithAppendHook(t *testing.T, hook func(string, net.Conn)) string {
 	t.Helper()
 
 	memSrv := imapmemserver.New()
@@ -74,8 +92,12 @@ func startMemIMAP(t *testing.T) string {
 	memSrv.AddUser(user2)
 
 	srv := imapserver.New(&imapserver.Options{
-		NewSession: func(_ *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
-			return memSrv.NewSession(), nil, nil
+		NewSession: func(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+			session := memSrv.NewSession()
+			if hook != nil {
+				session = &ambiguousAppendSession{SessionIMAP4rev2: session.(imapserver.SessionIMAP4rev2), conn: conn.NetConn(), hook: hook}
+			}
+			return session, nil, nil
 		},
 		Caps: imap.CapSet{
 			imap.CapIMAP4rev1: {},
@@ -93,6 +115,53 @@ func startMemIMAP(t *testing.T) string {
 	}()
 	t.Cleanup(func() { _ = ln.Close() })
 	return ln.Addr().String()
+}
+
+type ambiguousAppendSession struct {
+	imapserver.SessionIMAP4rev2
+	conn net.Conn
+	hook func(string, net.Conn)
+}
+
+func (session *ambiguousAppendSession) Append(mailbox string, reader imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
+	result, err := session.SessionIMAP4rev2.Append(mailbox, reader, options)
+	if err == nil {
+		session.hook(mailbox, session.conn)
+	}
+	return result, err
+}
+
+func TestEndToEnd_AmbiguousOpenAppend(t *testing.T) {
+	var dropped atomic.Bool
+	addr := startMemIMAPWithFault(t, &dropped)
+	target := startEchoServer(t)
+	clientCfg := &config.Config{Mode: config.ModeClient, Listen: freePort(t), PingIntervalMs: -1, Accounts: []config.AccountConfig{makeAccount(addr, "Tunnel.C2S", "Tunnel.S2C")}}
+	serverCfg := &config.Config{Mode: config.ModeServer, Target: target, Accounts: []config.AccountConfig{makeAccount(addr, "Tunnel.S2C", "Tunnel.C2S")}}
+	client, server := mustNew(t, clientCfg), mustNew(t, serverCfg)
+	var dials atomic.Int32
+	server.dialTarget = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dials.Add(1)
+		return (&net.Dialer{}).DialContext(ctx, network, address)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() { defer workers.Done(); _ = server.Run(ctx) }()
+	go func() { defer workers.Done(); _ = client.Run(ctx) }()
+	defer func() { cancel(); workers.Wait() }()
+	waitForTransport(t, client, server)
+	conn, err := net.Dial("tcp", clientCfg.Listen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	_, _ = io.WriteString(conn, "exactly once")
+	_ = conn.(*net.TCPConn).CloseWrite()
+	body, err := io.ReadAll(conn)
+	if err != nil || string(body) != "exactly once" || !dropped.Load() || dials.Load() != 1 {
+		t.Fatalf("body=%q err=%v dropped=%v dials=%d", body, err, dropped.Load(), dials.Load())
+	}
 }
 
 // startEchoServer starts a tiny TCP echo server and returns its address.
@@ -274,6 +343,243 @@ func TestEndToEnd_SingleAccount(t *testing.T) {
 
 	cancel()
 	wg.Wait()
+}
+
+func TestEndToEnd_RequestHalfCloseResponse(t *testing.T) {
+	for _, mode := range []config.MultipathMode{config.MultipathModeStreamAffinity, config.MultipathModeFrameRoundRobin} {
+		for _, async := range []bool{false, true} {
+			for _, zeroRTT := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/async=%v/zero=%v", mode, async, zeroRTT), func(t *testing.T) {
+					imapAddr := startMemIMAP(t)
+					target, err := net.Listen("tcp", "127.0.0.1:0")
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer target.Close()
+					response := strings.Repeat("half-close-response-", 55000)
+					requestSeen := make(chan string, 1)
+					go func() {
+						conn, err := target.Accept()
+						if err != nil {
+							return
+						}
+						defer conn.Close()
+						body, err := io.ReadAll(conn)
+						if err != nil {
+							return
+						}
+						requestSeen <- string(body)
+						_, _ = io.WriteString(conn, response)
+					}()
+					clientCfg := &config.Config{Mode: config.ModeClient, Listen: freePort(t), AsyncDataSend: async, ZeroRTTOpen: &zeroRTT, PingIntervalMs: -1,
+						Accounts: []config.AccountConfig{makeAccount(imapAddr, "Tunnel.C2S", "Tunnel.S2C")}}
+					serverCfg := &config.Config{Mode: config.ModeServer, Target: target.Addr().String(), AsyncDataSend: async,
+						Accounts: []config.AccountConfig{makeAccount(imapAddr, "Tunnel.S2C", "Tunnel.C2S")}}
+					clientCfg.MultipathMode, serverCfg.MultipathMode = mode, mode
+					if mode == config.MultipathModeFrameRoundRobin {
+						clientCfg.Accounts = append(clientCfg.Accounts, makeAccountUser(imapAddr, "tit2", "tit-pass2", "Tunnel.C2S", "Tunnel.S2C"))
+						serverCfg.Accounts = append(serverCfg.Accounts, makeAccountUser(imapAddr, "tit2", "tit-pass2", "Tunnel.S2C", "Tunnel.C2S"))
+					}
+					ctx, cancel := context.WithCancel(context.Background())
+					server, client := mustNew(t, serverCfg), mustNew(t, clientCfg)
+					var workers sync.WaitGroup
+					workers.Add(2)
+					go func() { defer workers.Done(); _ = server.Run(ctx) }()
+					go func() { defer workers.Done(); _ = client.Run(ctx) }()
+					defer func() { cancel(); workers.Wait() }()
+					waitForTransport(t, client, server)
+					if mode == config.MultipathModeFrameRoundRobin {
+						for index := 0; index < 2; index++ {
+							if err := client.paths.SendVia(index, protocol.Frame{Type: protocol.MsgPing, Payload: make([]byte, 8)}); err != nil {
+								t.Fatal(err)
+							}
+						}
+						deadline := time.NewTimer(5 * time.Second)
+						defer deadline.Stop()
+						tick := time.NewTicker(10 * time.Millisecond)
+						defer tick.Stop()
+						for client.paths.ProvenCount() != 2 || server.paths.ProvenCount() != 2 {
+							select {
+							case <-tick.C:
+							case <-deadline.C:
+								t.Fatal("multipath not proven")
+							}
+						}
+					}
+					conn, err := net.Dial("tcp", clientCfg.Listen)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer conn.Close()
+					_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+					_, _ = io.WriteString(conn, "request requiring EOF")
+					_ = conn.(*net.TCPConn).CloseWrite()
+					body, err := io.ReadAll(conn)
+					if err != nil || string(body) != response {
+						t.Fatalf("response bytes=%d want=%d err=%v", len(body), len(response), err)
+					}
+					select {
+					case request := <-requestSeen:
+						if request != "request requiring EOF" {
+							t.Fatalf("request=%q", request)
+						}
+					case <-time.After(time.Second):
+						t.Fatal("missing request")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestEndToEnd_AmbiguousOpenAppendBatch(t *testing.T) {
+	var dropped atomic.Bool
+	addr := startMemIMAPWithFault(t, &dropped)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	observed := make(chan string, 2)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() { defer conn.Close(); body, _ := io.ReadAll(conn); observed <- string(body) }()
+		}
+	}()
+	server := mustNew(t, &config.Config{Mode: config.ModeServer, Target: listener.Addr().String(), Accounts: []config.AccountConfig{makeAccount(addr, "Tunnel.S2C", "Tunnel.C2S")}})
+	var dials atomic.Int32
+	server.dialTarget = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dials.Add(1)
+		return (&net.Dialer{}).DialContext(ctx, network, address)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = server.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+	waitForTransport(t, server)
+	frames, err := protocol.EncodeBatch([]protocol.Frame{{Type: protocol.MsgOpen, StreamID: 7, SeqID: 1}, {Type: protocol.MsgData, StreamID: 7, SeqID: 2, Payload: []byte("batched once")}, {Type: protocol.MsgFin, StreamID: 7, SeqID: 3}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("Subject: test\r\nContent-Transfer-Encoding: base64\r\n\r\n" + base64.StdEncoding.EncodeToString(frames) + "\r\n")
+	for attempt := 0; attempt < 2; attempt++ {
+		client, err := imapclient.DialInsecure(addr, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.Login("tit", "tit-pass").Wait(); err != nil {
+			t.Fatal(err)
+		}
+		cmd := client.Append("Tunnel.C2S", int64(len(body)), nil)
+		_, _ = cmd.Write(body)
+		_ = cmd.Close()
+		_, err = cmd.Wait()
+		_ = client.Close()
+		if attempt == 0 && err == nil {
+			t.Fatal("first APPEND did not lose status")
+		}
+		if attempt == 1 && err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case body := <-observed:
+		if body != "batched once" {
+			t.Fatalf("payload=%q", body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("batch not delivered")
+	}
+	cancel()
+	<-done
+	if dials.Load() != 1 {
+		t.Fatalf("duplicate batch dialed %d times", dials.Load())
+	}
+}
+
+func waitForTransport(t *testing.T, tunnels ...*Tunnel) {
+	t.Helper()
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		ready := true
+		for _, tun := range tunnels {
+			ready = ready && tun.paths.AllConnected() && tun.paths.AnyReceiveReady()
+		}
+		if ready {
+			return
+		}
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			t.Fatal("transport not ready")
+		}
+	}
+}
+
+func TestEndToEnd_BurstyClientsRemainCompatible(t *testing.T) {
+	for _, async := range []bool{false, true} {
+		t.Run(fmt.Sprintf("async=%v", async), func(t *testing.T) {
+			addr := startMemIMAP(t)
+			target := startEchoServer(t)
+			server := mustNew(t, &config.Config{Mode: config.ModeServer, Target: target, AsyncDataSend: async, Accounts: []config.AccountConfig{makeAccount(addr, "Tunnel.S2C", "Tunnel.C2S")}})
+			ctx, cancel := context.WithCancel(context.Background())
+			var workers sync.WaitGroup
+			workers.Add(1)
+			go func() { defer workers.Done(); _ = server.Run(ctx) }()
+			defer func() { cancel(); workers.Wait() }()
+			clients := make([]*Tunnel, 8)
+			for index := range clients {
+				client := mustNew(t, &config.Config{Mode: config.ModeClient, Listen: freePort(t), ClientID: byte(index + 1), AsyncDataSend: async, PingIntervalMs: -1, Accounts: []config.AccountConfig{makeAccount(addr, "Tunnel.C2S", "Tunnel.S2C")}})
+				clients[index] = client
+				workers.Add(1)
+				go func() { defer workers.Done(); _ = client.Run(ctx) }()
+			}
+			waitForTransport(t, append(clients, server)...)
+			failures := make(chan error, 2*len(clients))
+			var transfers sync.WaitGroup
+			for index, client := range clients {
+				transfers.Add(1)
+				go func(index int, client *Tunnel) {
+					defer transfers.Done()
+					conn, err := net.Dial("tcp", client.cfg.Listen)
+					if err != nil {
+						failures <- err
+						return
+					}
+					defer conn.Close()
+					_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
+					payload := strings.Repeat(fmt.Sprintf("client-%d", index), 300000)
+					written := make(chan error, 1)
+					go func() {
+						_, err := io.WriteString(conn, payload)
+						if err == nil {
+							err = conn.(*net.TCPConn).CloseWrite()
+						}
+						written <- err
+					}()
+					body, err := io.ReadAll(conn)
+					if err != nil || string(body) != payload {
+						failures <- fmt.Errorf("client %d: bytes=%d want=%d err=%v", index, len(body), len(payload), err)
+					}
+					if err := <-written; err != nil {
+						failures <- err
+					}
+				}(index, client)
+			}
+			transfers.Wait()
+			close(failures)
+			for err := range failures {
+				t.Error(err)
+			}
+		})
+	}
 }
 
 func TestEndToEnd_Multiplex(t *testing.T) {
@@ -1167,10 +1473,7 @@ func TestEndToEnd_ZeroRTT_DialFail(t *testing.T) {
 	t.Parallel()
 
 	imapAddr := startMemIMAP(t)
-	// Point the server at a port that has no listener — the dial will
-	// fail immediately (or after the dial timeout on platforms where
-	// closed ports linger).
-	badTarget := freePort(t)
+	badTarget := "127.0.0.1:1"
 	clientListen := freePort(t)
 
 	rt := true
@@ -1196,6 +1499,9 @@ func TestEndToEnd_ZeroRTT_DialFail(t *testing.T) {
 	defer cancel()
 
 	server := mustNew(t, serverCfg)
+	server.dialTarget = func(context.Context, string, string) (net.Conn, error) {
+		return nil, fmt.Errorf("injected connection refusal")
+	}
 	client := mustNew(t, clientCfg)
 	var wg sync.WaitGroup
 	wg.Add(2)

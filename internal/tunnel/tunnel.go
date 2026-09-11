@@ -48,11 +48,19 @@ type Tunnel struct {
 	// 0-RTT OPEN work end to end.
 	pendingDialsMu sync.Mutex
 	pendingDials   map[uint32]*pendingDial
+	openResults    map[uint32]*openResult
+	controlMu      sync.Mutex
+	controls       []controlReply
+	controlWake    chan struct{}
+	controlDone    chan struct{}
+	controlStopped bool
+	dialTarget     func(context.Context, string, string) (net.Conn, error)
 
 	// baseCtx is the tunnel-owned context that parents server-side target
 	// dials. It is cancelled during shutdown so in-flight dials abort
 	// instead of running under context.Background().
 	baseCtx context.Context
+	runCtx  context.Context
 
 	// shuttingDown is set before the graceful-shutdown RST burst so the
 	// dispatch loop stops admitting new server-side OPENs while the
@@ -61,7 +69,8 @@ type Tunnel struct {
 
 	// dialWG tracks in-flight server-side dial goroutines so shutdown can
 	// wait for them to release their target sockets.
-	dialWG sync.WaitGroup
+	dialWG  sync.WaitGroup
+	workers sync.WaitGroup
 }
 
 // pendingDial is the server-side bookkeeping for an in-flight OPEN.
@@ -111,24 +120,23 @@ func New(cfg *config.Config) (*Tunnel, error) {
 		cfg:          cfg,
 		pendingOpens: make(map[uint32]chan protocol.Frame),
 		pendingDials: make(map[uint32]*pendingDial),
+		openResults:  make(map[uint32]*openResult),
+		controlWake:  make(chan struct{}, 1),
+		controlDone:  make(chan struct{}),
 	}
 
 	t.streams = streams.NewManager(t.sendFrame)
 	t.streams.Reorder = cfg.ReorderEnabled()
 	t.streams.InboundQueueSize = cfg.InboundQueueSize()
 	t.streams.OutboundQueueWait = cfg.InboundQueueWait()
+	t.streams.OnDuplicateOpen = t.replayOpen
+	t.streams.OnLocalReset = func(streamID uint32) {
+		t.queueControl(protocol.Frame{Type: protocol.MsgRst, StreamID: streamID}, "")
+	}
 	t.streams.OnReorderReset = func(streamID uint32) {
 		label := t.paths.RouteLabel(streamID)
 		rst := protocol.Frame{Type: protocol.MsgRst, StreamID: streamID}
-		var err error
-		if label != "" {
-			err = t.paths.SendViaLabel(label, rst)
-		} else {
-			err = t.paths.Send(rst)
-		}
-		if err != nil {
-			tlog.Debugf("reorder reset RST send failed stream=%d: %v", streamID, err)
-		}
+		t.queueControl(rst, label)
 	}
 
 	// Multi-client filter: when ClientID is set on a client, only
@@ -147,9 +155,15 @@ func New(cfg *config.Config) (*Tunnel, error) {
 
 	t.paths = NewMultipath(cfg, t.handleIncomingFrame, filter, keys)
 	t.paths.OnAsyncSendError = t.handleAsyncSendError
+	t.streams.OnClosing = func(streamID uint32) {
+		if t.runCtx != nil && t.runCtx.Err() != nil && t.baseCtx.Err() == nil {
+			t.queueControl(protocol.Frame{Type: protocol.MsgRst, StreamID: streamID}, "")
+		}
+	}
 	// Drop the route entry when a stream is removed, so the route table
 	// doesn't grow without bound.
 	t.streams.OnRemove = func(streamID uint32) {
+		t.retireOpen(streamID)
 		tlog.Infof("stream closed stream=%d client_id=%d mode=%s account=%q active_streams=%d",
 			streamID, protocol.StreamClientID(streamID), cfg.Mode, t.paths.RouteLabel(streamID), t.streams.Count())
 		t.paths.CancelStream(streamID)
@@ -186,10 +200,8 @@ func (t *Tunnel) handleAsyncSendError(f protocol.Frame, err error) {
 	}
 	tlog.Warnf("async DATA send failed stream=%d client_id=%d: %v; resetting stream",
 		f.StreamID, protocol.StreamClientID(f.StreamID), err)
-	if rstErr := t.streams.SendFrame(protocol.Frame{Type: protocol.MsgRst, StreamID: f.StreamID}); rstErr != nil {
-		tlog.Debugf("async DATA reset send failed stream=%d: %v", f.StreamID, rstErr)
-	}
 	t.streams.CloseStream(s)
+	t.queueControl(protocol.Frame{Type: protocol.MsgRst, StreamID: f.StreamID}, "")
 }
 
 // Run executes the configured mode until ctx is cancelled. On exit it
@@ -209,18 +221,23 @@ func (t *Tunnel) handleAsyncSendError(f protocol.Frame, err error) {
 // the senders would already be tearing down by the time we try to
 // dispatch the RST frames.
 func (t *Tunnel) Run(ctx context.Context) error {
+	ctx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
 	pathsCtx, cancelPaths := context.WithCancel(context.Background())
 	defer cancelPaths()
 	// Server-side target dials are parented to this context so shutdown
 	// cancels any dial still in flight instead of leaking it under
 	// context.Background().
 	t.baseCtx = pathsCtx
+	t.runCtx = ctx
+	go t.runControls(pathsCtx)
 	t.paths.Start(pathsCtx)
 
 	// Client-only: periodic end-to-end RTT probe. Disabled in server
 	// mode (servers only respond to pings, they don't initiate them).
 	if t.cfg.Mode == config.ModeClient && t.cfg.PingEnabled() {
-		go t.runPingLoop(ctx)
+		t.workers.Add(1)
+		go func() { defer t.workers.Done(); t.runPingLoop(ctx) }()
 	}
 
 	var err error
@@ -232,6 +249,7 @@ func (t *Tunnel) Run(ctx context.Context) error {
 	default:
 		err = fmt.Errorf("unsupported mode %q", t.cfg.Mode)
 	}
+	cancelRun()
 
 	// Graceful shutdown: tell the peer about every still-open stream
 	// before we tear down the transport. Stop admitting new server-side
@@ -242,11 +260,9 @@ func (t *Tunnel) Run(ctx context.Context) error {
 	// Now stop the multipath and wait for it. Cancelling pathsCtx also
 	// aborts any in-flight target dial (they are parented to it).
 	cancelPaths()
-	t.paths.Wait()
-
-	// Local TCP sockets last — by this point all peer state has been
-	// notified and the transport is gone.
 	t.streams.CloseAll()
+	t.paths.Wait()
+	<-t.controlDone
 
 	// Finally, wait for server-side dial goroutines to finish releasing
 	// their sockets. Bounded so an unresponsive target can't hang shutdown
@@ -256,6 +272,10 @@ func (t *Tunnel) Run(ctx context.Context) error {
 		dialWait = t.cfg.DialTimeout()
 	}
 	t.waitForDials(dialWait)
+	t.workers.Wait()
+	t.pendingDialsMu.Lock()
+	clear(t.openResults)
+	t.pendingDialsMu.Unlock()
 	return err
 }
 
@@ -269,15 +289,14 @@ func (t *Tunnel) Run(ctx context.Context) error {
 // most of the streams will have been cleaned up cleanly.
 func (t *Tunnel) gracefulShutdown() {
 	ids := t.streams.ActiveIDs()
-	if len(ids) == 0 {
-		return
-	}
 	deadline := t.cfg.GracefulShutdown()
 	tlog.Infof("graceful shutdown: emitting RST for %d active stream(s) (deadline %v)",
 		len(ids), deadline)
 
 	done := make(chan struct{})
+	t.workers.Add(1)
 	go func() {
+		defer t.workers.Done()
 		defer close(done)
 		for _, id := range ids {
 			if err := t.streams.SendFrame(protocol.Frame{
@@ -291,6 +310,7 @@ func (t *Tunnel) gracefulShutdown() {
 				// teardown.
 			}
 		}
+		t.flushControls()
 	}()
 	select {
 	case <-done:
@@ -424,17 +444,14 @@ func (t *Tunnel) dispatchOrdered(f protocol.Frame, source string) {
 			if t.shuttingDown.Load() {
 				// Transport is tearing down; don't start new dials. Tell
 				// the client so it doesn't wait out its OPEN timeout.
-				_ = t.streams.SendFrame(protocol.Frame{
+				t.queueControl(protocol.Frame{
 					Type:     protocol.MsgOpenFail,
 					StreamID: f.StreamID,
 					Payload:  []byte("server shutting down"),
-				})
+				}, "")
 				return
 			}
-			if source != "" {
-				t.paths.PinByLabel(f.StreamID, source)
-			}
-			t.beginPendingOpen(f.StreamID)
+			t.beginPendingOpen(f.StreamID, source)
 		} else {
 			tlog.Warnf("client received unexpected OPEN stream=%d", f.StreamID)
 		}
@@ -466,6 +483,10 @@ func (t *Tunnel) dispatchOrdered(f protocol.Frame, source string) {
 		// falls through to HandleData and behaves normally.
 		if pd := t.lookupPendingDial(f.StreamID); pd != nil {
 			pd.mu.Lock()
+			if pd.rstRecv {
+				pd.mu.Unlock()
+				return
+			}
 			if !pd.drained {
 				cp := make([]byte, len(f.Payload))
 				copy(cp, f.Payload)
@@ -505,12 +526,12 @@ func (t *Tunnel) dispatchOrdered(f protocol.Frame, source string) {
 			cancel := pd.cancel
 			if !pd.drained {
 				pd.rstRecv = true
-				pd.buffered = append(pd.buffered,
-					bufferedEvent{kind: protocol.MsgRst})
+				pd.buffered = nil
 				pd.mu.Unlock()
 				if cancel != nil {
 					cancel()
 				}
+				t.streams.HandleRst(f.StreamID)
 				return
 			}
 			pd.mu.Unlock()
@@ -539,15 +560,7 @@ func (t *Tunnel) dispatchOrdered(f protocol.Frame, source string) {
 				StreamID: f.StreamID,
 				Payload:  payload,
 			}
-			if err := t.paths.SendViaLabel(source, pong); err != nil {
-				if t.cfg.Mode == config.ModeServer {
-					tlog.Warnf("pong send failed via %q: %v", source, err)
-				} else {
-					tlog.Debugf("ping echo failed: %v", err)
-				}
-			} else if t.cfg.Mode == config.ModeServer {
-				tlog.Infof("pong sent via %q payload_len=%d", source, len(payload))
-			}
+			t.queueControl(pong, source)
 		}
 
 	case protocol.MsgPong:
@@ -578,9 +591,7 @@ func (t *Tunnel) resetUnknownStream(f protocol.Frame) bool {
 	}
 	tlog.Warnf("%s for unknown stream=%d client_id=%d; sending RST",
 		protocol.TypeName(f.Type), f.StreamID, protocol.StreamClientID(f.StreamID))
-	if err := t.streams.SendFrame(protocol.Frame{Type: protocol.MsgRst, StreamID: f.StreamID}); err != nil {
-		tlog.Debugf("RST for unknown stream=%d failed: %v", f.StreamID, err)
-	}
+	t.queueControl(protocol.Frame{Type: protocol.MsgRst, StreamID: f.StreamID}, "")
 	return true
 }
 
@@ -605,12 +616,28 @@ func pingClientVersion(payload []byte) string {
 // beginPendingOpen registers a pendingDial entry for streamID and
 // launches the dial goroutine. Returns immediately so the watcher's
 // dispatch loop can deliver subsequent DATA/FIN/RST frames.
-func (t *Tunnel) beginPendingOpen(streamID uint32) {
+func (t *Tunnel) beginPendingOpen(streamID uint32, source string) {
 	pd := &pendingDial{done: make(chan struct{})}
 	t.pendingDialsMu.Lock()
+	if result := t.openResults[streamID]; result != nil && (result.expires.IsZero() || time.Now().Before(result.expires)) {
+		t.pendingDialsMu.Unlock()
+		t.replayOpen(streamID)
+		return
+	}
+	if t.pendingDials[streamID] != nil || t.streams.Get(streamID) != nil {
+		t.pendingDialsMu.Unlock()
+		return
+	}
+	if t.openResults == nil {
+		t.openResults = make(map[uint32]*openResult)
+	}
+	t.openResults[streamID] = &openResult{}
 	t.pendingDials[streamID] = pd
-	t.pendingDialsMu.Unlock()
 	t.dialWG.Add(1)
+	t.pendingDialsMu.Unlock()
+	if source != "" {
+		t.paths.PinByLabel(streamID, source)
+	}
 	go t.handleOpen(streamID, pd)
 }
 
@@ -624,6 +651,11 @@ func (t *Tunnel) lookupPendingDial(streamID uint32) *pendingDial {
 // removePendingDial drops the bookkeeping entry. Idempotent.
 func (t *Tunnel) removePendingDial(streamID uint32) {
 	t.pendingDialsMu.Lock()
+	if pending := t.pendingDials[streamID]; pending != nil {
+		pending.mu.Lock()
+		pending.buffered = nil
+		pending.mu.Unlock()
+	}
 	delete(t.pendingDials, streamID)
 	t.pendingDialsMu.Unlock()
 }
@@ -673,7 +705,8 @@ func (t *Tunnel) runClient(ctx context.Context) error {
 			tlog.Warnf("accept error: %v", err)
 			continue
 		}
-		go t.handleAccept(ctx, conn)
+		t.workers.Add(1)
+		go func() { defer t.workers.Done(); t.handleAccept(ctx, conn) }()
 	}
 }
 
@@ -684,6 +717,8 @@ func (t *Tunnel) runClient(ctx context.Context) error {
 // echo-RTT. The OPEN_OK / OPEN_FAIL response is watched by a background
 // goroutine that tears the TCP socket down if the dial failed.
 func (t *Tunnel) handleAccept(ctx context.Context, conn net.Conn) {
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
 	}
@@ -697,8 +732,7 @@ func (t *Tunnel) handleAccept(ctx context.Context, conn net.Conn) {
 	// Stamp the configured ClientID into the top byte of the stream ID
 	// so the server can route the response back to this client and
 	// other clients sharing the same folder pair leave it alone.
-	localID := t.streams.NextID() & protocol.StreamLocalIDMask
-	streamID := protocol.MakeStreamID(t.cfg.ClientID, localID)
+	streamID := t.streams.NextIDForClient(t.cfg.ClientID)
 
 	// Pick an account for this stream up front. All outbound frames for
 	// the stream will be routed through this account, so latency stays
@@ -734,14 +768,15 @@ func (t *Tunnel) handleAccept(ctx context.Context, conn net.Conn) {
 			return
 		}
 		t.streams.ReadLoop(s)
-		t.streams.CloseStream(s)
 		return
 	}
 
 	// 0-RTT path: start ReadLoop NOW; a background
 	// goroutine watches the channel and closes the stream if the
 	// server replies OPEN_FAIL.
+	t.workers.Add(1)
 	go func() {
+		defer t.workers.Done()
 		select {
 		case resp, ok := <-ch:
 			if !ok {
@@ -767,7 +802,6 @@ func (t *Tunnel) handleAccept(ctx context.Context, conn net.Conn) {
 		}
 	}()
 	t.streams.ReadLoop(s)
-	t.streams.CloseStream(s)
 }
 
 // registerAndSendOpen registers the local stream before transmitting OPEN.
@@ -779,6 +813,9 @@ func (t *Tunnel) registerAndSendOpen(s *streams.Stream) error {
 	t.streams.Register(s)
 	if err := t.streams.SendFrame(protocol.Frame{Type: protocol.MsgOpen, StreamID: s.ID}); err != nil {
 		t.streams.CloseStream(s)
+		t.pendingDialsMu.Lock()
+		clear(t.openResults)
+		t.pendingDialsMu.Unlock()
 		return err
 	}
 	return nil
@@ -873,7 +910,9 @@ func (t *Tunnel) handleOpen(streamID uint32, pd *pendingDial) {
 	if parent == nil {
 		parent = context.Background()
 	}
-	dialCtx, cancel := context.WithTimeout(parent, t.cfg.DialTimeout())
+	lifetimeCtx, cancel := context.WithCancel(parent)
+	dialCtx, cancelDial := context.WithTimeout(lifetimeCtx, t.cfg.DialTimeout())
+	defer cancelDial()
 	pd.mu.Lock()
 	pd.cancel = cancel
 	earlyRst := pd.rstRecv
@@ -881,24 +920,27 @@ func (t *Tunnel) handleOpen(streamID uint32, pd *pendingDial) {
 	defer cancel()
 
 	if earlyRst {
+		t.retireOpen(streamID)
 		// Peer RST'd before we'd even started — nothing to do.
 		t.paths.RemoveRoute(streamID)
 		return
 	}
 
-	d := net.Dialer{}
-	conn, err := d.DialContext(dialCtx, "tcp", t.cfg.Target)
+	dial := t.dialTarget
+	if dial == nil {
+		dial = (&net.Dialer{}).DialContext
+	}
+	conn, err := dial(dialCtx, "tcp", t.cfg.Target)
+	cancelDial()
 	if err != nil {
 		tlog.Warnf("dial target %s failed for stream=%d client_id=%d: %v",
 			t.cfg.Target, streamID, protocol.StreamClientID(streamID), err)
-		_ = t.streams.SendFrame(protocol.Frame{
-			Type:     protocol.MsgOpenFail,
-			StreamID: streamID,
-			Payload:  []byte(err.Error()),
-		})
+		_ = t.sendOpenResponse(streamID, protocol.MsgOpenFail, []byte(err.Error()))
 		t.paths.RemoveRoute(streamID)
 		return
 	}
+	stopClose := context.AfterFunc(lifetimeCtx, func() { _ = conn.Close() })
+	defer stopClose()
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
 	}
@@ -906,8 +948,9 @@ func (t *Tunnel) handleOpen(streamID uint32, pd *pendingDial) {
 	// If shutdown began after this dial was launched, don't promote it to
 	// a live stream — close the fresh socket and let the client learn via
 	// its OPEN timeout / our graceful RSTs.
-	if t.shuttingDown.Load() {
+	if t.shuttingDown.Load() || lifetimeCtx.Err() != nil {
 		_ = conn.Close()
+		t.retireOpen(streamID)
 		t.paths.RemoveRoute(streamID)
 		return
 	}
@@ -919,7 +962,7 @@ func (t *Tunnel) handleOpen(streamID uint32, pd *pendingDial) {
 	s := &streams.Stream{ID: streamID, Conn: conn}
 	t.streams.Register(s)
 
-	if err := t.streams.SendFrame(protocol.Frame{Type: protocol.MsgOpenOK, StreamID: streamID}); err != nil {
+	if err := t.sendOpenResponse(streamID, protocol.MsgOpenOK, nil); err != nil {
 		tlog.Warnf("send OPEN_OK failed stream=%d client_id=%d: %v",
 			streamID, protocol.StreamClientID(streamID), err)
 		t.streams.CloseStream(s)
@@ -936,6 +979,12 @@ func (t *Tunnel) handleOpen(streamID uint32, pd *pendingDial) {
 	abort := false
 	for !abort {
 		pd.mu.Lock()
+		if pd.rstRecv || lifetimeCtx.Err() != nil {
+			pd.buffered = nil
+			pd.mu.Unlock()
+			abort = true
+			break
+		}
 		if len(pd.buffered) == 0 {
 			pd.drained = true
 			pd.mu.Unlock()
@@ -958,6 +1007,7 @@ func (t *Tunnel) handleOpen(streamID uint32, pd *pendingDial) {
 				if tc, ok := conn.(*net.TCPConn); ok {
 					_ = tc.CloseWrite()
 				}
+				t.streams.FinishWrite(s)
 			case protocol.MsgRst:
 				abort = true
 			}
@@ -976,5 +1026,4 @@ func (t *Tunnel) handleOpen(streamID uint32, pd *pendingDial) {
 	}
 
 	t.streams.ReadLoop(s)
-	t.streams.CloseStream(s)
 }

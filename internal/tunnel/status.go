@@ -1,18 +1,22 @@
 package tunnel
 
-import "time"
+import (
+	"github.com/noiseonwires/true-imap-tunnel/internal/streams"
+	"time"
+)
 
 type StatusSnapshot struct {
-	Mode              string          `json:"mode"`
-	Listen            string          `json:"listen,omitempty"`
-	Target            string          `json:"target,omitempty"`
-	ClientID          uint8           `json:"client_id,omitempty"`
-	ClientVersion     string          `json:"client_version,omitempty"`
-	ActiveStreams     int             `json:"active_streams"`
-	AccountsTotal     int             `json:"accounts_total"`
-	AccountsConnected int             `json:"accounts_connected"`
-	AccountsProven    int             `json:"accounts_proven"`
-	Accounts          []AccountStatus `json:"accounts"`
+	Mode              string               `json:"mode"`
+	Listen            string               `json:"listen,omitempty"`
+	Target            string               `json:"target,omitempty"`
+	ClientID          uint8                `json:"client_id,omitempty"`
+	ClientVersion     string               `json:"client_version,omitempty"`
+	ActiveStreams     int                  `json:"active_streams"`
+	AccountsTotal     int                  `json:"accounts_total"`
+	AccountsConnected int                  `json:"accounts_connected"`
+	AccountsProven    int                  `json:"accounts_proven"`
+	Accounts          []AccountStatus      `json:"accounts"`
+	ReorderGaps       []streams.ReorderGap `json:"reorder_gaps,omitempty"`
 }
 
 type AccountStatus struct {
@@ -46,6 +50,7 @@ func (t *Tunnel) StatusSnapshot() StatusSnapshot {
 		AccountsTotal:     t.paths.SenderCount(),
 		AccountsConnected: t.paths.ConnectedCount(),
 		AccountsProven:    t.paths.ProvenCount(),
+		ReorderGaps:       t.streams.ReorderGaps(time.Now()),
 	}
 	s.Accounts = t.paths.AccountStatuses()
 	return s

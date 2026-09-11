@@ -132,6 +132,7 @@ type Watcher struct {
 	throttledUntilNS atomic.Int64
 
 	failDelay time.Duration
+	cleanupWG sync.WaitGroup
 }
 
 // NewWatcher constructs (but does not connect) a Watcher. keys may be
@@ -245,6 +246,7 @@ func (w *Watcher) LastFrameAt() time.Time {
 // Run drives the watcher until ctx is cancelled. It reconnects on any
 // error with exponential backoff bounded by ReconnectMaxDelay.
 func (w *Watcher) Run(ctx context.Context) {
+	defer w.cleanupWG.Wait()
 	for {
 		if err := ctx.Err(); err != nil {
 			return
@@ -288,7 +290,6 @@ func (w *Watcher) Run(ctx context.Context) {
 		// Always tear down before retry.
 		w.mu.Lock()
 		if w.client != nil {
-			_ = w.client.Logout().Wait()
 			_ = w.client.Close()
 			w.client = nil
 		}
@@ -342,7 +343,7 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 		},
 	}
 
-	c, err := dialClient(w.acc, opts)
+	c, err := dialClientContext(ctx, w.acc, opts)
 	if err != nil {
 		return err
 	}
@@ -1061,7 +1062,9 @@ func (w *Watcher) startStartupCleanup(ctx context.Context, c *imapclient.Client,
 }
 
 func (w *Watcher) startDedicatedStartupCleanup(ctx context.Context, maxUID imap.UID, uidValidity uint32) {
+	w.cleanupWG.Add(1)
 	go func() {
+		defer w.cleanupWG.Done()
 		if err := w.cleanupStartupMessages(ctx, maxUID, uidValidity); err != nil {
 			if ctx.Err() == nil {
 				tlog.Warnf("watcher %s: startup cleanup failed: %v",
@@ -1077,12 +1080,11 @@ func (w *Watcher) cleanupStartupMessages(ctx context.Context, maxUID imap.UID, u
 		return err
 	}
 
-	c, err := dialClient(w.acc, nil)
+	c, err := dialClientContext(ctx, w.acc, nil)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		_ = c.Logout().Wait()
 		_ = c.Close()
 	}()
 

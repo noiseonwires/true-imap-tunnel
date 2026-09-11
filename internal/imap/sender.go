@@ -82,6 +82,7 @@ type Sender struct {
 	AsyncErrorHandler func(protocol.Frame, error)
 
 	appendHook func([]byte) error
+	runCtx     context.Context
 }
 
 const (
@@ -98,8 +99,10 @@ var (
 
 // sendReq is a queued APPEND request from a caller of Send.
 type sendReq struct {
-	frame protocol.Frame
-	reply chan error
+	frame    protocol.Frame
+	reply    chan error
+	complete func(error)
+	ctx      context.Context
 }
 
 // NewSender constructs (but does not connect) a Sender. keys may be
@@ -165,7 +168,14 @@ func (s *Sender) BatchCount() uint64 { return s.batchCount.Load() }
 // the frame waits in the buffered queue; if Run has already exited
 // (shutdown), Send returns the shutdown error.
 func (s *Sender) Send(f protocol.Frame) error {
-	req := &sendReq{frame: f, reply: make(chan error, 1)}
+	return s.SendContext(context.Background(), f)
+}
+
+func (s *Sender) SendContext(ctx context.Context, f protocol.Frame) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	req := &sendReq{frame: f, reply: make(chan error, 1), ctx: ctx}
 	select {
 	case <-s.done:
 		return errSenderStopped
@@ -173,12 +183,16 @@ func (s *Sender) Send(f protocol.Frame) error {
 	}
 	select {
 	case s.queue <- req:
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-s.done:
 		return errSenderStopped
 	}
 	select {
 	case err := <-req.reply:
 		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-s.done:
 		// Run exited while we were waiting. Prefer a real reply if the
 		// batch already completed (drainPendingWithError may have
@@ -197,14 +211,27 @@ func (s *Sender) Send(f protocol.Frame) error {
 // Used only for DATA fast-paths where throughput matters more than per-frame
 // synchronous error reporting; queue capacity still provides back-pressure.
 func (s *Sender) Enqueue(f protocol.Frame) error {
+	return s.EnqueueTracked(f, nil)
+}
+
+func (s *Sender) EnqueueTracked(f protocol.Frame, complete func(error)) error {
+	return s.EnqueueContext(context.Background(), f, complete)
+}
+
+func (s *Sender) EnqueueContext(ctx context.Context, f protocol.Frame, complete func(error)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	select {
 	case <-s.done:
 		return errSenderStopped
 	default:
 	}
 	select {
-	case s.queue <- &sendReq{frame: f}:
+	case s.queue <- &sendReq{frame: f, complete: complete, ctx: ctx}:
 		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-s.done:
 		return errSenderStopped
 	}
@@ -230,6 +257,10 @@ func (s *Sender) AllowStream(streamID uint32) {
 
 // connect ensures s.client is established. Caller must hold s.mu.
 func (s *Sender) connect() error {
+	return s.connectContext(s.context())
+}
+
+func (s *Sender) connectContext(ctx context.Context) error {
 	if s.client != nil {
 		return nil
 	}
@@ -238,7 +269,7 @@ func (s *Sender) connect() error {
 			time.Since(s.lastFail).Round(time.Millisecond), s.failDelay)
 	}
 
-	c, err := dialClient(s.acc, nil)
+	c, err := dialClientContexts(ctx, s.context(), s.acc, nil)
 	if err != nil {
 		s.lastFail = time.Now()
 		next := time.Duration(float64(s.failDelay) * s.cfg.ReconnectBackoffMultiplier())
@@ -277,7 +308,6 @@ func (s *Sender) disconnect() {
 	if s.client == nil {
 		return
 	}
-	_ = s.client.Logout().Wait()
 	_ = s.client.Close()
 	s.client = nil
 	s.connected.Store(false)
@@ -308,6 +338,8 @@ func (s *Sender) markFailed(err error) {
 // Multipath callers that don't want to wait on a disconnected sender
 // should consult Sender.Connected() first.
 func (s *Sender) Run(ctx context.Context) {
+	s.runCtx = ctx
+	defer func() { s.mu.Lock(); s.disconnect(); s.mu.Unlock() }()
 	// Closing done unblocks any Send/Enqueue callers waiting on the queue
 	// once this loop exits (shutdown).
 	defer close(s.done)
@@ -327,6 +359,10 @@ func (s *Sender) Run(ctx context.Context) {
 	defer noop.Stop()
 
 	for {
+		if ctx.Err() != nil {
+			s.drainPendingWithError(ctx.Err())
+			return
+		}
 		// Step 1: ensure we have a connection. If not, wait on a
 		// short retry timer (or cancellation) WITHOUT touching the
 		// queue — requests that arrived during a disconnect must
@@ -369,6 +405,7 @@ func (s *Sender) Run(ctx context.Context) {
 			default:
 			}
 			first = s.pending[0]
+			s.pending[0] = nil
 			s.pending = s.pending[1:]
 		} else {
 			select {
@@ -425,33 +462,26 @@ func (s *Sender) opportunisticDrain(batch []*sendReq) []*sendReq {
 	for _, r := range batch {
 		totalBytes += len(r.frame.Payload) + protocol.HeaderSize
 	}
-	for len(batch) < maxFrames && totalBytes < maxBytes && len(s.pending) > 0 {
-		r := s.pending[0]
-		if s.dropIfCanceled(r) {
-			s.pending = s.pending[1:]
+	candidates := s.pending
+	s.pending = nil
+	available := len(s.queue)
+	for inspected := 0; inspected < available; inspected++ {
+		select {
+		case request := <-s.queue:
+			candidates = append(candidates, request)
+		default:
+		}
+	}
+	for index, request := range candidates {
+		candidates[index] = nil
+		if s.dropIfCanceled(request) {
 			continue
 		}
-		if batchClientID(r.frame) != clientID {
-			break
-		}
-		s.pending = s.pending[1:]
-		batch = append(batch, r)
-		totalBytes += len(r.frame.Payload) + protocol.HeaderSize
-	}
-	for len(batch) < maxFrames && totalBytes < maxBytes {
-		select {
-		case r := <-s.queue:
-			if s.dropIfCanceled(r) {
-				continue
-			}
-			if batchClientID(r.frame) != clientID {
-				s.pending = append(s.pending, r)
-				continue
-			}
-			batch = append(batch, r)
-			totalBytes += len(r.frame.Payload) + protocol.HeaderSize
-		default:
-			return batch
+		if batchClientID(request.frame) == clientID && len(batch) < maxFrames && totalBytes < maxBytes {
+			batch = append(batch, request)
+			totalBytes += len(request.frame.Payload) + protocol.HeaderSize
+		} else {
+			s.pending = append(s.pending, request)
 		}
 	}
 	return batch
@@ -511,11 +541,22 @@ func (s *Sender) sendBatch(reqs []*sendReq) {
 	defer s.mu.Unlock()
 
 	start := time.Now()
+	batchCtx, cancel := context.WithCancel(s.context())
+	defer cancel()
+	for _, req := range reqs {
+		if req.ctx != nil {
+			stop := context.AfterFunc(req.ctx, cancel)
+			defer stop()
+			if req.ctx.Err() != nil {
+				cancel()
+			}
+		}
+	}
 	opts := &imap.AppendOptions{
 		Flags: []imap.Flag{imap.FlagDraft, imap.FlagSeen},
 		Time:  time.Now(),
 	}
-	if err := s.appendWithRetryLocked(body, opts); err != nil {
+	if err := s.appendWithRetryLocked(batchCtx, body, opts); err != nil {
 		s.replyAll(reqs, err)
 		return
 	}
@@ -543,10 +584,15 @@ func (s *Sender) filterCanceled(reqs []*sendReq) []*sendReq {
 		}
 		out = append(out, r)
 	}
+	clear(reqs[len(out):])
 	return out
 }
 
 func (s *Sender) dropIfCanceled(r *sendReq) bool {
+	if r != nil && r.ctx != nil && r.ctx.Err() != nil {
+		s.replyAll([]*sendReq{r}, r.ctx.Err())
+		return true
+	}
 	if r == nil || !dropAfterCancel(r.frame.Type) || r.frame.StreamID == 0 {
 		return false
 	}
@@ -561,6 +607,9 @@ func (s *Sender) dropIfCanceled(r *sendReq) bool {
 	}
 	if r.reply != nil {
 		r.reply <- errStreamCanceled
+	}
+	if r.complete != nil {
+		r.complete(errStreamCanceled)
 	}
 	return true
 }
@@ -604,27 +653,39 @@ func (s *Sender) sweepCanceled(now time.Time) {
 	})
 }
 
-func (s *Sender) appendWithRetryLocked(body []byte, opts *imap.AppendOptions) error {
+func (s *Sender) appendWithRetryLocked(ctx context.Context, body []byte, opts *imap.AppendOptions) error {
 	var lastErr error
 	for attempt := 1; attempt <= appendMaxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if s.client == nil && s.appendHook == nil {
-			if err := s.connect(); err != nil {
+			if err := s.connectContext(ctx); err != nil {
 				lastErr = fmt.Errorf("connect: %w", err)
 				tlog.Warnf("sender %s: APPEND retry connect attempt %d/%d failed: %v",
 					s.acc.Label(), attempt, appendMaxAttempts, err)
 				if attempt < appendMaxAttempts {
 					s.lastFail = time.Time{}
 				}
-				s.waitBeforeAppendRetryLocked(attempt)
+				s.waitBeforeAppendRetryLocked(ctx, attempt)
 				continue
 			}
 		}
 
-		if err := s.appendOnceLocked(body, opts); err != nil {
+		stop := func() bool { return true }
+		if client := s.client; client != nil {
+			stop = context.AfterFunc(ctx, func() { _ = client.Close() })
+		}
+		err := s.appendOnceLocked(body, opts)
+		stop()
+		if err != nil {
 			lastErr = err
 			tlog.Warnf("sender %s: APPEND attempt %d/%d failed: %v",
 				s.acc.Label(), attempt, appendMaxAttempts, err)
 			s.markFailed(err)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			// On throttle markers, don't burn through the remaining
 			// attempts — the server already told us to back off.
 			if s.cfg.ThrottleBackoff() > 0 && IsThrottleError(err) {
@@ -633,7 +694,7 @@ func (s *Sender) appendWithRetryLocked(body []byte, opts *imap.AppendOptions) er
 			if attempt < appendMaxAttempts {
 				s.lastFail = time.Time{}
 			}
-			s.waitBeforeAppendRetryLocked(attempt)
+			s.waitBeforeAppendRetryLocked(ctx, attempt)
 			continue
 		}
 
@@ -649,11 +710,23 @@ func (s *Sender) appendWithRetryLocked(body []byte, opts *imap.AppendOptions) er
 	return fmt.Errorf("append failed after %d attempts: %w", appendMaxAttempts, lastErr)
 }
 
-func (s *Sender) waitBeforeAppendRetryLocked(attempt int) {
+func (s *Sender) waitBeforeAppendRetryLocked(ctx context.Context, attempt int) {
 	if attempt >= appendMaxAttempts {
 		return
 	}
-	time.Sleep(time.Duration(attempt) * appendRetryDelay)
+	timer := time.NewTimer(time.Duration(attempt) * appendRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+}
+
+func (s *Sender) context() context.Context {
+	if s.runCtx != nil {
+		return s.runCtx
+	}
+	return context.Background()
 }
 
 func (s *Sender) appendOnceLocked(body []byte, opts *imap.AppendOptions) error {
@@ -700,9 +773,7 @@ func (s *Sender) drainPendingWithError(err error) {
 	for {
 		select {
 		case r := <-s.queue:
-			if r.reply != nil {
-				r.reply <- err
-			}
+			s.replyAll([]*sendReq{r}, err)
 		default:
 			return
 		}
@@ -713,10 +784,13 @@ func (s *Sender) drainPendingWithError(err error) {
 // reply channel.
 func (s *Sender) replyAll(reqs []*sendReq, err error) {
 	for _, r := range reqs {
+		if r.complete != nil {
+			r.complete(err)
+		}
 		if r.reply != nil {
 			r.reply <- err
 		} else if err != nil && s.AsyncErrorHandler != nil {
-			go s.AsyncErrorHandler(r.frame, err)
+			s.AsyncErrorHandler(r.frame, err)
 		}
 	}
 }

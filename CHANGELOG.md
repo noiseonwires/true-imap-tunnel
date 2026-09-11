@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Duplicate OPEN retries preserve live sequencing, replay the original open response, and avoid duplicate target dials. Client stream IDs skip active and recently reserved IDs.
+- TCP half-close preserves the opposite direction; FIN waits for async DATA completion across paths before graceful stream cleanup.
+- IMAP connection setup, queue waits, retries, and pending target writes respond to cancellation. Receive-generated control replies no longer block mailbox dispatch.
+- Sender batching yields between queue snapshots and preserves deferred per-client ordering. Closed streams and completed work release retained state.
+
+### Added
+
+- Read-only `reorder_gaps` status diagnostics: stream ID, missing sequence, pending frame/payload-byte counts, and age. Observation does not reset quiet streams.
+- Failure-path and burst regression tests, CI race detection, and an opt-in real-IMAP HTTP latency/download smoke test.
+
 ## v0.4.2
 
 ### Fixed

@@ -1,7 +1,13 @@
 package imap
 
 import (
+	"bufio"
+	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -291,5 +297,223 @@ func TestSweepCanceledEvictsExpiredTombstones(t *testing.T) {
 	})
 	if remaining != len(fresh) {
 		t.Fatalf("remaining tombstones = %d, want %d", remaining, len(fresh))
+	}
+}
+
+func TestSendCancellationWhileQueueFull(t *testing.T) {
+	sender := testSender()
+	for count := 0; count < cap(sender.queue); count++ {
+		sender.queue <- testReq(protocol.MsgData, 1)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	go func() { finished <- sender.SendContext(ctx, protocol.Frame{Type: protocol.MsgData, StreamID: 2}) }()
+	cancel()
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queue cancellation blocked")
+	}
+	if len(sender.queue) != cap(sender.queue) {
+		t.Fatal("canceled send changed full queue")
+	}
+}
+
+func TestBatchDrainPreservesDeferredClientFIFO(t *testing.T) {
+	sender := testSender()
+	first := testReq(protocol.MsgData, protocol.MakeStreamID(1, 1))
+	older := testReq(protocol.MsgData, protocol.MakeStreamID(1, 2))
+	newer := testReq(protocol.MsgData, protocol.MakeStreamID(1, 3))
+	other := testReq(protocol.MsgData, protocol.MakeStreamID(2, 1))
+	sender.pending = []*sendReq{other, older}
+	sender.queue <- newer
+	batch := sender.opportunisticDrain([]*sendReq{first})
+	if len(batch) != 3 || batch[1] != older || batch[2] != newer || len(sender.pending) != 1 || sender.pending[0] != other {
+		t.Fatal("deferred FIFO or client isolation violated")
+	}
+}
+
+func TestBatchDrainYieldsFairly(t *testing.T) {
+	sender := testSender()
+	first := testReq(protocol.MsgData, protocol.MakeStreamID(1, 1))
+	second := testReq(protocol.MsgData, protocol.MakeStreamID(2, 1))
+	third := testReq(protocol.MsgData, protocol.MakeStreamID(3, 1))
+	sender.pending = []*sendReq{second, third}
+	for count := 0; count < cap(sender.queue); count++ {
+		sender.queue <- testReq(protocol.MsgData, protocol.MakeStreamID(1, uint32(count+2)))
+	}
+	_ = sender.opportunisticDrain([]*sendReq{first})
+	for _, want := range []*sendReq{second, third} {
+		if len(sender.pending) == 0 || sender.pending[0] != want {
+			t.Fatal("busy client starved another client")
+		}
+		sender.pending[0] = nil
+		sender.pending = sender.pending[1:]
+		for len(sender.queue) < cap(sender.queue) {
+			sender.queue <- testReq(protocol.MsgData, protocol.MakeStreamID(1, 50))
+		}
+		batch := sender.opportunisticDrain([]*sendReq{want})
+		if batch[0] != want {
+			t.Fatal("queued client did not get service")
+		}
+	}
+}
+
+func TestAsyncBatchFailureCompletesEveryRequest(t *testing.T) {
+	sender := testSender()
+	sender.appendHook = func([]byte) error { return errors.New("append unavailable") }
+	completed := make(map[uint32]int)
+	failed := make(map[uint32]int)
+	sender.AsyncErrorHandler = func(frame protocol.Frame, err error) {
+		if err == nil {
+			t.Error("missing async error")
+		}
+		failed[frame.StreamID]++
+	}
+	var requests []*sendReq
+	for id := uint32(1); id <= 3; id++ {
+		requests = append(requests, &sendReq{frame: protocol.Frame{Type: protocol.MsgData, StreamID: id}, complete: func(err error) {
+			if err == nil {
+				t.Error("missing completion error")
+			}
+			completed[id]++
+		}})
+	}
+	sender.sendBatch(requests)
+	for id := uint32(1); id <= 3; id++ {
+		if completed[id] != 1 || failed[id] != 1 {
+			t.Fatalf("stream %d completion=%d failure=%d", id, completed[id], failed[id])
+		}
+	}
+}
+
+func TestDeferredClientBurstDrainsWithoutLoss(t *testing.T) {
+	sender := testSender()
+	var expected []*sendReq
+	for index := 0; index < 1000; index++ {
+		request := testReq(protocol.MsgData, protocol.MakeStreamID(byte(index%8+1), uint32(index/8+1)))
+		expected = append(expected, request)
+		sender.pending = append(sender.pending, request)
+	}
+	seen := make(map[*sendReq]bool)
+	last := make(map[byte]uint32)
+	for len(sender.pending) > 0 {
+		first := sender.pending[0]
+		sender.pending[0] = nil
+		sender.pending = sender.pending[1:]
+		batch := sender.opportunisticDrain([]*sendReq{first})
+		clientID := batchClientID(first.frame)
+		for _, request := range batch {
+			id := request.frame.StreamID & protocol.StreamLocalIDMask
+			if seen[request] || batchClientID(request.frame) != clientID || id <= last[clientID] {
+				t.Fatal("duplicate, mixed client, or reordered burst")
+			}
+			seen[request], last[clientID] = true, id
+		}
+	}
+	if len(seen) != len(expected) {
+		t.Fatalf("drained %d want %d", len(seen), len(expected))
+	}
+}
+
+func TestQueuedCanceledRequestIsNotAppended(t *testing.T) {
+	sender := testSender()
+	ctx, cancel := context.WithCancel(context.Background())
+	completed := make(chan error, 1)
+	if err := sender.EnqueueContext(ctx, protocol.Frame{Type: protocol.MsgData, StreamID: 1}, func(err error) { completed <- err }); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	sender.appendHook = func([]byte) error { t.Error("canceled request appended"); return nil }
+	sender.sendBatch([]*sendReq{<-sender.queue})
+	if err := <-completed; !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+}
+
+func TestSenderCancellationDuringIMAPOperation(t *testing.T) {
+	for _, phase := range []string{"greeting", "login", "continuation", "append-result"} {
+		t.Run(phase, func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			reached := make(chan struct{})
+			peerDone := make(chan struct{})
+			go func() {
+				defer close(peerDone)
+				conn, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				reader := bufio.NewReader(conn)
+				stall := func() { close(reached); _, _ = io.Copy(io.Discard, reader) }
+				if phase == "greeting" {
+					stall()
+					return
+				}
+				_, _ = io.WriteString(conn, "* OK [CAPABILITY IMAP4rev1] ready\r\n")
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						return
+					}
+					fields := strings.Fields(line)
+					if len(fields) < 2 {
+						return
+					}
+					switch fields[1] {
+					case "LOGIN":
+						if phase == "login" {
+							stall()
+							return
+						}
+					case "APPEND":
+						if phase == "continuation" {
+							stall()
+							return
+						}
+						var size int
+						_, _ = fmt.Sscanf(line[strings.LastIndex(line, "{"):], "{%d}", &size)
+						_, _ = io.WriteString(conn, "+ continue\r\n")
+						_, _ = io.CopyN(io.Discard, reader, int64(size))
+						_, _ = reader.ReadString('\n')
+						stall()
+						return
+					case "CAPABILITY":
+						_, _ = io.WriteString(conn, "* CAPABILITY IMAP4rev1\r\n")
+					}
+					_, _ = fmt.Fprintf(conn, "%s OK done\r\n", fields[0])
+				}
+			}()
+			sender := NewSender(&config.Config{}, &config.AccountConfig{Host: listener.Addr().String(), TLS: "none", Username: "test", Password: "test", FolderSend: "out"}, nil)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go sender.Run(ctx)
+			if err := sender.Enqueue(protocol.Frame{Type: protocol.MsgData, StreamID: 1, Payload: []byte("data")}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-reached:
+			case <-time.After(3 * time.Second):
+				t.Fatal("phase not reached")
+			}
+			cancel()
+			select {
+			case <-sender.done:
+			case <-time.After(time.Second):
+				t.Fatal("sender did not cancel")
+			}
+			select {
+			case <-peerDone:
+			case <-time.After(time.Second):
+				t.Fatal("socket did not close")
+			}
+		})
 	}
 }

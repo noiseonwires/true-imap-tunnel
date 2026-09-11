@@ -2,6 +2,7 @@ package streams
 
 import (
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -184,7 +185,7 @@ func TestReorderGapResetNotifiesPeerAndDropsLateFrames(t *testing.T) {
 	}
 }
 
-func TestReorderTombstoneClearedByFreshOpen(t *testing.T) {
+func TestReorderTombstoneRejectsReplayedOpen(t *testing.T) {
 	m := NewManager(func(f protocol.Frame) error { return nil })
 	m.Reorder = true
 
@@ -196,11 +197,203 @@ func TestReorderTombstoneClearedByFreshOpen(t *testing.T) {
 	m.DispatchFrame(protocol.Frame{StreamID: 9, SeqID: 2, Type: protocol.MsgData}, deliver)
 	m.DispatchFrame(protocol.Frame{StreamID: 9, SeqID: 1, Type: protocol.MsgOpen}, deliver)
 
-	if len(got) != 1 {
-		t.Fatalf("got %d delivered frames want fresh OPEN only: %+v", len(got), got)
+	if len(got) != 0 {
+		t.Fatalf("replayed closed stream delivered: %+v", got)
 	}
-	if got[0].Type != protocol.MsgOpen || got[0].StreamID != 9 || got[0].SeqID != 1 {
-		t.Fatalf("got %+v want fresh OPEN", got[0])
+}
+
+func TestDuplicateOpenPreservesReceiveSequence(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		manager := NewManager(func(protocol.Frame) error { return nil })
+		manager.Reorder = true
+		var delivered []uint32
+		handler := func(frame protocol.Frame) { delivered = append(delivered, frame.SeqID) }
+		open := protocol.Frame{Type: protocol.MsgOpen, StreamID: 1, SeqID: 1}
+		second := protocol.Frame{Type: protocol.MsgData, StreamID: 1, SeqID: 2}
+		third := protocol.Frame{Type: protocol.MsgData, StreamID: 1, SeqID: 3}
+		manager.DispatchFrame(open, handler)
+		if pending {
+			manager.DispatchFrame(third, handler)
+		} else {
+			manager.DispatchFrame(second, handler)
+		}
+		manager.DispatchFrame(open, handler)
+		manager.DispatchFrame(second, handler)
+		manager.DispatchFrame(third, handler)
+		if len(delivered) != 3 || delivered[0] != 1 || delivered[1] != 2 || delivered[2] != 3 {
+			t.Fatalf("pending=%v delivered=%v, want [1 2 3]", pending, delivered)
+		}
+	}
+}
+
+func TestStreamIDAllocationSkipsReservedIDs(t *testing.T) {
+	manager := NewManager(func(protocol.Frame) error { return nil })
+	manager.nextID.Store(protocol.StreamLocalIDMask)
+	first := manager.NextIDForClient(7)
+	manager.Remove(first)
+	manager.nextID.Store(protocol.StreamLocalIDMask)
+	second := manager.NextIDForClient(7)
+	if second != protocol.MakeStreamID(7, 1) {
+		t.Fatalf("wrapped allocation=%d", second)
+	}
+	manager.nextID.Store(1)
+	if next := manager.NextIDForClient(7); next != protocol.MakeStreamID(7, 2) {
+		t.Fatalf("reserved allocation=%d", next)
+	}
+}
+
+func TestQuietReorderGapDoesNotIntroduceReset(t *testing.T) {
+	manager := NewManager(func(protocol.Frame) error { return nil })
+	manager.Reorder = true
+	var delivered []uint32
+	deliver := func(frame protocol.Frame) { delivered = append(delivered, frame.SeqID) }
+	manager.DispatchFrame(protocol.Frame{Type: protocol.MsgData, StreamID: 1, SeqID: 1}, deliver)
+	manager.DispatchFrame(protocol.Frame{Type: protocol.MsgData, StreamID: 1, SeqID: 3, Payload: []byte("third")}, deliver)
+	future := time.Now().Add(time.Hour)
+	gap := manager.ReorderGaps(future)
+	if len(gap) != 1 || gap[0].AgeMs < 3500000 || gap[0].PendingBytes != 5 || gap[0].ExpectedSeq != 2 {
+		t.Fatalf("gaps=%+v", gap)
+	}
+	manager.DispatchFrame(protocol.Frame{Type: protocol.MsgData, StreamID: 1, SeqID: 3, Payload: []byte("third")}, deliver)
+	if again := manager.ReorderGaps(future); len(again) != 1 || again[0] != gap[0] {
+		t.Fatalf("duplicate changed gap: %+v", again)
+	}
+	manager.DispatchFrame(protocol.Frame{Type: protocol.MsgData, StreamID: 1, SeqID: 2}, deliver)
+	if len(delivered) != 3 || delivered[1] != 2 || delivered[2] != 3 || len(manager.ReorderGaps(future)) != 0 {
+		t.Fatalf("delivery=%v gaps=%+v", delivered, manager.ReorderGaps(future))
+	}
+	manager.DispatchFrame(protocol.Frame{Type: protocol.MsgData, StreamID: 2, SeqID: 5, Payload: []byte("orphan")}, deliver)
+	if len(manager.ReorderGaps(future)) != 1 {
+		t.Fatal("orphan observation evicted state")
+	}
+	manager.CloseAll()
+	if len(manager.ReorderGaps(future)) != 0 {
+		t.Fatal("shutdown retained gap")
+	}
+}
+
+func TestReorderDiagnosticCloseRace(t *testing.T) {
+	manager := NewManager(func(protocol.Frame) error { return nil })
+	manager.Reorder = true
+	var workers sync.WaitGroup
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		for count := 0; count < 1000; count++ {
+			manager.ReorderGaps(time.Now())
+		}
+	}()
+	for id := uint32(1); id < 100; id++ {
+		manager.DispatchFrame(protocol.Frame{Type: protocol.MsgData, StreamID: id, SeqID: 3}, func(protocol.Frame) {})
+		manager.Remove(id)
+	}
+	workers.Wait()
+	if len(manager.ReorderGaps(time.Now())) != 0 {
+		t.Fatal("closed streams in diagnostics")
+	}
+}
+
+func TestSimultaneousFinRemovesStreamOnce(t *testing.T) {
+	manager := NewManager(func(protocol.Frame) error { return nil })
+	local, remote := net.Pipe()
+	defer remote.Close()
+	stream := &Stream{ID: 1, Conn: local}
+	manager.Register(stream)
+	removed := make(chan uint32, 2)
+	manager.OnRemove = func(id uint32) { removed <- id }
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() { defer workers.Done(); manager.finishRead(stream) }()
+	go func() { defer workers.Done(); manager.FinishWrite(stream) }()
+	workers.Wait()
+	if len(removed) != 1 || manager.Count() != 0 {
+		t.Fatal("FIN did not remove exactly once")
+	}
+	<-stream.writerDone
+}
+
+func TestStreamAbortSendsResetOnceAndNeverEchoesPeerReset(t *testing.T) {
+	for _, peerReset := range []bool{false, true} {
+		resets := make(chan uint32, 4)
+		manager := NewManager(func(protocol.Frame) error { return nil })
+		manager.OnLocalReset = func(id uint32) { resets <- id }
+		stream := &Stream{ID: 1, Conn: &eofTestConn{}}
+		manager.Register(stream)
+		if peerReset {
+			manager.HandleRst(1)
+		}
+		var workers sync.WaitGroup
+		workers.Add(2)
+		go func() { defer workers.Done(); manager.abortStream(stream) }()
+		go func() { defer workers.Done(); manager.abortStream(stream) }()
+		workers.Wait()
+		want := 1
+		if peerReset {
+			want = 0
+		}
+		if len(resets) != want {
+			t.Fatalf("peerReset=%v resets=%d want=%d", peerReset, len(resets), want)
+		}
+		<-stream.writerDone
+	}
+}
+
+func TestFinSendFailureAbortsStream(t *testing.T) {
+	manager := NewManager(func(frame protocol.Frame) error {
+		if frame.Type == protocol.MsgFin {
+			return errors.New("append failed")
+		}
+		return nil
+	})
+	stream := &Stream{ID: 1, Conn: &eofTestConn{}}
+	manager.Register(stream)
+	manager.ReadLoop(stream)
+	if manager.Count() != 0 {
+		t.Fatal("failed FIN retained stream")
+	}
+	<-stream.writerDone
+}
+
+type eofTestConn struct{ net.Conn }
+
+func (*eofTestConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (*eofTestConn) Close() error             { return nil }
+
+func TestRemoteFinWaitsForQueuedData(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	peer, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	local, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(func(protocol.Frame) error { return nil })
+	stream := &Stream{ID: 1, Conn: local}
+	manager.Register(stream)
+	defer manager.CloseAll()
+	manager.HandleData(1, []byte("first"))
+	manager.HandleData(1, []byte("second"))
+	manager.HandleFin(1)
+	_ = peer.SetDeadline(time.Now().Add(time.Second))
+	body, err := io.ReadAll(peer)
+	if err != nil || string(body) != "firstsecond" {
+		t.Fatalf("body=%q err=%v", body, err)
+	}
+	if manager.Count() != 1 {
+		t.Fatal("remote FIN closed both directions")
+	}
+	_, _ = peer.Write([]byte("still readable"))
+	_ = local.SetReadDeadline(time.Now().Add(time.Second))
+	buffer := make([]byte, 14)
+	if _, err := io.ReadFull(local, buffer); err != nil || string(buffer) != "still readable" {
+		t.Fatalf("opposite direction: %q %v", buffer, err)
 	}
 }
 

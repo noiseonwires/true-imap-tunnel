@@ -15,6 +15,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -384,39 +385,86 @@ func stripASCIIWhitespace(b []byte) []byte {
 // dialClient establishes an authenticated IMAP connection using the
 // account's configured TLS mode and credentials.
 func dialClient(acc *config.AccountConfig, opts *imapclient.Options) (*imapclient.Client, error) {
+	return dialClientContext(context.Background(), acc, opts)
+}
+
+type contextConn struct {
+	net.Conn
+	stop func() bool
+}
+
+func (conn *contextConn) Close() error {
+	conn.stop()
+	return conn.Conn.Close()
+}
+
+func dialClientContext(ctx context.Context, acc *config.AccountConfig, opts *imapclient.Options) (*imapclient.Client, error) {
+	return dialClientContexts(ctx, ctx, acc, opts)
+}
+
+func dialClientContexts(ctx, lifetime context.Context, acc *config.AccountConfig, opts *imapclient.Options) (*imapclient.Client, error) {
 	if opts == nil {
 		opts = &imapclient.Options{}
 	}
+	copyOptions := *opts
+	opts = &copyOptions
 	opts.Dialer = netprotect.WrapDialer(opts.Dialer)
 
 	dialHost := acc.Host
 
-	if opts.TLSConfig == nil && acc.InsecureSkipVerify {
-		opts.TLSConfig = &tls.Config{InsecureSkipVerify: true}
-	} else if acc.InsecureSkipVerify && opts.TLSConfig != nil {
-		opts.TLSConfig.InsecureSkipVerify = true
+	if opts.TLSConfig == nil {
+		opts.TLSConfig = &tls.Config{}
+	} else {
+		opts.TLSConfig = opts.TLSConfig.Clone()
 	}
-
-	var (
-		c   *imapclient.Client
-		err error
-	)
-	switch acc.TLS {
-	case "implicit", "":
-		c, err = imapclient.DialTLS(dialHost, opts)
-	case "starttls":
-		c, err = imapclient.DialStartTLS(dialHost, opts)
-	case "none":
-		c, err = imapclient.DialInsecure(dialHost, opts)
-	default:
+	opts.TLSConfig.InsecureSkipVerify = opts.TLSConfig.InsecureSkipVerify || acc.InsecureSkipVerify
+	if opts.TLSConfig.ServerName == "" {
+		host, _, err := net.SplitHostPort(dialHost)
+		if err != nil {
+			return nil, err
+		}
+		opts.TLSConfig.ServerName = host
+	}
+	if acc.TLS != "" && acc.TLS != "implicit" && acc.TLS != "starttls" && acc.TLS != "none" {
 		return nil, fmt.Errorf("unknown tls mode %q", acc.TLS)
 	}
+	dialCtx := ctx
+	if opts.Dialer.Timeout > 0 {
+		var cancel context.CancelFunc
+		dialCtx, cancel = context.WithTimeout(ctx, opts.Dialer.Timeout)
+		defer cancel()
+	}
+	raw, err := opts.Dialer.DialContext(dialCtx, "tcp", dialHost)
 	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", acc.Host, err)
+	}
+	stopDial := context.AfterFunc(ctx, func() { _ = raw.Close() })
+	defer stopDial()
+	conn := &contextConn{Conn: raw, stop: context.AfterFunc(lifetime, func() { _ = raw.Close() })}
+
+	var c *imapclient.Client
+	switch acc.TLS {
+	case "implicit", "":
+		if opts.TLSConfig.NextProtos == nil {
+			opts.TLSConfig.NextProtos = []string{"imap"}
+		}
+		tlsConn := tls.Client(conn, opts.TLSConfig)
+		err = tlsConn.HandshakeContext(dialCtx)
+		if err == nil {
+			c = imapclient.New(tlsConn, opts)
+		}
+	case "starttls":
+		c, err = imapclient.NewStartTLS(conn, opts)
+	case "none":
+		c = imapclient.New(conn, opts)
+	}
+	if err != nil {
+		_ = conn.Close()
 		return nil, fmt.Errorf("dial %s: %w", acc.Host, err)
 	}
 
 	if acc.UseOAuth2() {
-		ctx, cancel := context.WithTimeout(context.Background(), tokenCommandTimeout)
+		ctx, cancel := context.WithTimeout(ctx, tokenCommandTimeout)
 		defer cancel()
 		token, err := fetchOAuthToken(ctx, acc.OAuth2Token, acc.OAuth2TokenCommand)
 		if err != nil {

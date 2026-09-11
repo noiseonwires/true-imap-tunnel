@@ -30,6 +30,10 @@ jobs:
         run: go vet ./...
       - name: Run unit tests
         run: go test -count=1 -timeout 300s ./...
+      - name: Run race tests
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race -count=1 -timeout 300s ./...
 
   build-go:
     name: Go ${{ matrix.goos }}/${{ matrix.goarch }}
