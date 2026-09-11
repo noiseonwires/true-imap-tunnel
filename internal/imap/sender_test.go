@@ -2,6 +2,7 @@ package imap
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/noiseonwires/true-imap-tunnel/internal/config"
+	titcrypto "github.com/noiseonwires/true-imap-tunnel/internal/crypto"
 	"github.com/noiseonwires/true-imap-tunnel/internal/protocol"
 )
 
@@ -141,6 +143,134 @@ func TestSendBatchRetriesAppendBeforeSuccess(t *testing.T) {
 	}
 	if got := s.BatchCount(); got != 1 {
 		t.Fatalf("BatchCount = %d, want 1", got)
+	}
+	metrics := s.Metrics()
+	if metrics.AppendAttempts != 3 || metrics.AppendFailures != 2 {
+		t.Fatalf("retry metrics: %+v", metrics)
+	}
+}
+
+func TestSenderMetricsTrackOutstandingAndCancellation(t *testing.T) {
+	sender := testSender()
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := sender.EnqueueContext(ctx, protocol.Frame{Type: protocol.MsgData, StreamID: 1, Payload: []byte("payload")}, nil); err != nil {
+		t.Fatal(err)
+	}
+	queued := sender.Metrics()
+	if queued.OutstandingFrames != 1 || queued.OutstandingBytes != 16 {
+		t.Fatalf("queued: %+v", queued)
+	}
+	cancel()
+	sender.sendBatch([]*sendReq{<-sender.queue})
+	metrics := sender.Metrics()
+	if metrics.OutstandingFrames != 0 || metrics.OutstandingBytes != 0 || metrics.AppendAttempts != 0 {
+		t.Fatalf("canceled: %+v", metrics)
+	}
+	if err := sender.Enqueue(protocol.Frame{Type: protocol.MsgData, StreamID: 2, Payload: []byte("hello")}); err != nil {
+		t.Fatal(err)
+	}
+	sender.appendHook = func([]byte) error { return nil }
+	sender.sendBatch([]*sendReq{<-sender.queue})
+	metrics = sender.Metrics()
+	if metrics.PayloadBytes != 5 || metrics.AppendAttempts != 1 || metrics.OutstandingBytes != 0 || metrics.CompletedFrames != 2 {
+		t.Fatalf("completed: %+v", metrics)
+	}
+}
+
+func TestAsyncKickOnlyAfterSuccessfulBatch(t *testing.T) {
+	sender := testSender()
+	watcher := NewWatcher(&config.Config{}, &config.AccountConfig{}, nil, nil)
+	sender.OnBatchAppended = watcher.Kick
+	if err := sender.Enqueue(protocol.Frame{Type: protocol.MsgData, StreamID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if watcher.Metrics().KickWakeups != 0 {
+		t.Fatal("queue admission kicked watcher")
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	sender.appendHook = func([]byte) error { close(started); <-release; return nil }
+	done := make(chan struct{})
+	go func() { defer close(done); sender.sendBatch([]*sendReq{<-sender.queue}) }()
+	<-started
+	if watcher.Metrics().KickWakeups != 0 {
+		t.Fatal("incomplete APPEND kicked watcher")
+	}
+	close(release)
+	<-done
+	if watcher.Metrics().KickWakeups != 1 {
+		t.Fatal("successful APPEND did not kick")
+	}
+}
+
+func TestInteractiveControlUnderBulkLoad(t *testing.T) {
+	sender := testSender()
+	first := testReq(protocol.MsgData, protocol.MakeStreamID(1, 1))
+	second := testReq(protocol.MsgData, protocol.MakeStreamID(1, 2))
+	fin := testReq(protocol.MsgFin, protocol.MakeStreamID(1, 3))
+	ping := testReq(protocol.MsgPing, protocol.MakeStreamID(2, 0))
+	sender.pending = []*sendReq{second, fin, ping}
+	batch := sender.opportunisticDrain([]*sendReq{first})
+	if len(batch) != 1 || batch[0] != ping {
+		t.Fatal("control blocked behind unrelated bulk")
+	}
+	if len(sender.pending) != 3 || sender.pending[0] != first || sender.pending[1] != second || sender.pending[2] != fin {
+		t.Fatal("control priority reordered DATA/FIN")
+	}
+}
+
+func TestBatchSplittingPreservesLargeTransfer(t *testing.T) {
+	for _, passphrase := range []string{"", "test-encryption"} {
+		sender := testSender()
+		sender.cfg.BatchMaxKB = 64
+		keys, err := titcrypto.NewKeyRing(passphrase, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sender.keys = keys
+		payload := bytes.Repeat([]byte("large-transfer-"), 70001)
+		var got bytes.Buffer
+		var seq uint32
+		sender.appendHook = func(body []byte) error {
+			blob, err := extractFrame(body)
+			if err != nil {
+				return err
+			}
+			blob, _, err = keys.Decrypt(blob, 0)
+			if err != nil {
+				return err
+			}
+			var frames []protocol.Frame
+			if protocol.IsBatch(blob) {
+				frames, err = protocol.DecodeBatch(blob)
+			} else {
+				var frame protocol.Frame
+				frame, err = protocol.Decode(blob)
+				frames = []protocol.Frame{frame}
+			}
+			if err != nil {
+				return err
+			}
+			for _, frame := range frames {
+				seq++
+				if frame.SeqID != seq {
+					return fmt.Errorf("sequence=%d want=%d", frame.SeqID, seq)
+				}
+				got.Write(frame.Payload)
+			}
+			return nil
+		}
+		for offset := 0; offset < len(payload); offset += 32768 {
+			sender.pending = append(sender.pending, &sendReq{frame: protocol.Frame{Type: protocol.MsgData, StreamID: 1, SeqID: uint32(offset/32768 + 1), Payload: payload[offset:min(offset+32768, len(payload))]}})
+		}
+		for len(sender.pending) > 0 {
+			first := sender.pending[0]
+			sender.pending[0] = nil
+			sender.pending = sender.pending[1:]
+			sender.sendBatch(sender.opportunisticDrain([]*sendReq{first}))
+		}
+		if !bytes.Equal(payload, got.Bytes()) || sender.BatchCount() < 2 {
+			t.Fatalf("encrypted=%v output=%d want=%d", passphrase != "", got.Len(), len(payload))
+		}
 	}
 }
 

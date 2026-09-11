@@ -65,7 +65,12 @@ type Tunnel struct {
 	// shuttingDown is set before the graceful-shutdown RST burst so the
 	// dispatch loop stops admitting new server-side OPENs while the
 	// transport is being torn down.
-	shuttingDown atomic.Bool
+	shuttingDown    atomic.Bool
+	openCompleted   atomic.Uint64
+	openFailed      atomic.Uint64
+	openNanoseconds atomic.Uint64
+	receivedResets  atomic.Uint64
+	sentResets      atomic.Uint64
 
 	// dialWG tracks in-flight server-side dial goroutines so shutdown can
 	// wait for them to release their target sockets.
@@ -187,6 +192,9 @@ func (t *Tunnel) Paths() *Multipath { return t.paths }
 // sendFrame is the streams.SendFunc — routes outbound frames through the
 // multipath transport.
 func (t *Tunnel) sendFrame(f protocol.Frame) error {
+	if f.Type == protocol.MsgRst {
+		t.sentResets.Add(1)
+	}
 	return t.paths.Send(f)
 }
 
@@ -419,6 +427,9 @@ func (t *Tunnel) runPingLoop(ctx context.Context) {
 // per-call closure so that server-mode can pin a stream's outbound
 // route to the same account that delivered its OPEN.
 func (t *Tunnel) handleIncomingFrame(f protocol.Frame, source string) {
+	if f.Type == protocol.MsgRst {
+		t.receivedResets.Add(1)
+	}
 	t.streams.DispatchFrame(f, func(of protocol.Frame) {
 		t.dispatchOrdered(of, source)
 	})
@@ -755,7 +766,9 @@ func (t *Tunnel) handleAccept(ctx context.Context, conn net.Conn) {
 	defer cleanupPending()
 
 	s := &streams.Stream{ID: streamID, Conn: conn}
+	openStarted := time.Now()
 	if err := t.registerAndSendOpen(s); err != nil {
+		t.recordOpen(openStarted, false)
 		tlog.Warnf("send OPEN failed stream=%d client_id=%d: %v",
 			streamID, protocol.StreamClientID(streamID), err)
 		return
@@ -763,7 +776,9 @@ func (t *Tunnel) handleAccept(ctx context.Context, conn net.Conn) {
 
 	if !zeroRTT {
 		// Classic handshake: block until OPEN_OK/FAIL or timeout.
-		if !t.awaitOpenResponse(ctx, streamID, ch, s) {
+		opened := t.awaitOpenResponse(ctx, streamID, ch, s)
+		t.recordOpen(openStarted, opened)
+		if !opened {
 			t.streams.CloseStream(s)
 			return
 		}
@@ -777,6 +792,8 @@ func (t *Tunnel) handleAccept(ctx context.Context, conn net.Conn) {
 	t.workers.Add(1)
 	go func() {
 		defer t.workers.Done()
+		opened := false
+		defer func() { t.recordOpen(openStarted, opened) }()
 		select {
 		case resp, ok := <-ch:
 			if !ok {
@@ -792,6 +809,7 @@ func (t *Tunnel) handleAccept(ctx context.Context, conn net.Conn) {
 			}
 			tlog.Infof("stream opened stream=%d client_id=%d remote=%s",
 				streamID, protocol.StreamClientID(streamID), conn.RemoteAddr())
+			opened = true
 		case <-time.After(t.cfg.OpenTimeout()):
 			tlog.Warnf("OPEN timeout stream=%d client_id=%d (0-RTT, sending RST)",
 				streamID, protocol.StreamClientID(streamID))
@@ -802,6 +820,15 @@ func (t *Tunnel) handleAccept(ctx context.Context, conn net.Conn) {
 		}
 	}()
 	t.streams.ReadLoop(s)
+}
+
+func (t *Tunnel) recordOpen(started time.Time, success bool) {
+	t.openNanoseconds.Add(uint64(time.Since(started).Nanoseconds()))
+	if success {
+		t.openCompleted.Add(1)
+	} else {
+		t.openFailed.Add(1)
+	}
 }
 
 // registerAndSendOpen registers the local stream before transmitting OPEN.

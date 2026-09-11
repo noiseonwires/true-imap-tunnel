@@ -90,9 +90,19 @@ type Watcher struct {
 	// latency. The pending set is flushed when pendingCount reaches
 	// LazyExpungeThreshold, when LazyExpungeMaxAge has elapsed, or on
 	// shutdown.
-	pendingExpunge imap.UIDSet
-	pendingCount   int
-	lastExpunge    time.Time
+	pendingExpunge  imap.UIDSet
+	pendingCount    int
+	lastExpunge     time.Time
+	pendingSince    time.Time
+	pendingValidity uint32
+	pendingStore    bool
+	clock           func() time.Time
+	housekeeping    bool
+	emptyPolls      int
+	fetchCycles     atomic.Uint64
+	noopCount       atomic.Uint64
+	idleCount       atomic.Uint64
+	kickCount       atomic.Uint64
 
 	// activeUntilNS holds the wall-clock (UnixNano) until which the
 	// watcher polls at ActivePollInterval. Read/written atomically so
@@ -161,6 +171,7 @@ func (w *Watcher) Kick() {
 	// immediately so it can switch to the active interval.
 	select {
 	case w.kick <- struct{}{}:
+		w.kickCount.Add(1)
 	default:
 	}
 }
@@ -369,12 +380,12 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 
 	// Reset on success.
 	w.failDelay = w.cfg.ReconnectInitialDelay()
-	// Reset pending-expunge bookkeeping for the new session — UIDs
-	// from a prior session refer to a different connection and may
-	// even reference a different UIDVALIDITY.
-	w.pendingExpunge = imap.UIDSet{}
-	w.pendingCount = 0
-	w.lastExpunge = time.Time{}
+	w.resetPendingGeneration(sel.UIDValidity)
+	if w.pendingCount > 0 {
+		if err := w.flushPendingExpunge(); err != nil {
+			return err
+		}
+	}
 
 	// Establish the UID cursor only for the first connection to this mailbox
 	// generation. On reconnect with the same UIDVALIDITY, preserve lastUID:
@@ -439,6 +450,11 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if w.shouldFlushPendingExpunge() {
+			if err := w.flushPendingExpunge(); err != nil {
+				return err
+			}
+		}
 
 		if useIdle {
 			if err := w.waitIdle(ctx, c); err != nil {
@@ -450,6 +466,9 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 			}
 		}
 
+		if w.housekeeping {
+			continue
+		}
 		if err := w.fetchAndProcess(ctx); err != nil {
 			return err
 		}
@@ -462,22 +481,24 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 // progress deterministic on IMAP servers that occasionally miss or
 // coalesce EXISTS notifications while traffic is flowing.
 func (w *Watcher) waitIdle(ctx context.Context, c *imapclient.Client) error {
+	w.idleCount.Add(1)
 	idleCmd, err := c.Idle()
 	if err != nil {
 		return fmt.Errorf("idle: %w", err)
 	}
 
-	interval := w.cfg.PollInterval()
-	if w.activeNow() {
-		interval = w.cfg.ActivePollInterval()
-	}
+	w.housekeeping = false
+	interval := w.waitInterval()
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
 
 	select {
 	case <-w.notify:
+		w.emptyPolls = 0
 	case <-w.kick:
+		w.emptyPolls = 0
 	case <-timer.C:
+		w.housekeeping = w.shouldFlushPendingExpunge()
 	case <-ctx.Done():
 		w.closeIdleWithDeadline(idleCmd)
 		return ctx.Err()
@@ -529,21 +550,26 @@ func (w *Watcher) closeIdleWithDeadline(idleCmd *imapclient.IdleCommand) error {
 // The poll terminates early if w.notify or w.kick is signalled
 // mid-sleep.
 func (w *Watcher) waitPoll(ctx context.Context, c *imapclient.Client) error {
-	interval := w.cfg.PollInterval()
-	if w.activeNow() {
-		interval = w.cfg.ActivePollInterval()
-	}
+	w.housekeeping = false
+	interval := w.waitInterval()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-w.notify:
 		// Server pushed an untagged EXISTS without us asking — process
 		// it immediately.
+		w.emptyPolls = 0
 	case <-w.kick:
 		// Sender on this side just APPENDed — go check for a response
 		// right away using the active interval. Drop the sleep entirely.
+		w.emptyPolls = 0
 	case <-time.After(interval):
+		w.housekeeping = w.shouldFlushPendingExpunge()
 	}
+	if w.housekeeping {
+		return nil
+	}
+	w.noopCount.Add(1)
 	if err := c.Noop().Wait(); err != nil {
 		return fmt.Errorf("noop poll: %w", err)
 	}
@@ -585,7 +611,11 @@ func (w *Watcher) processRange(ctx context.Context, uidSet imap.UIDSet, dispatch
 	if err != nil {
 		return res.maxUID, err
 	}
-	return w.finishProcessRange(c, res, dispatch)
+	maxUID, finishErr := w.finishProcessRange(c, res, dispatch)
+	if finishErr != nil && dispatch && maxUID > w.lastUID {
+		w.lastUID = maxUID
+	}
+	return maxUID, finishErr
 }
 
 func (w *Watcher) processUndeletedRange(ctx context.Context, uidSet imap.UIDSet, dispatch bool) error {
@@ -867,20 +897,14 @@ func (w *Watcher) finishProcessRange(c *imapclient.Client, res processResult, di
 	// commands are placed on the wire back-to-back; the server processes
 	// them in order and we wait once at the end. That collapses what
 	// would be two sequential round-trips into one.
-	w.pendingExpunge.AddSet(res.owned)
-	w.pendingCount += res.ownedCount
+	w.addPendingExpunge(res.owned, res.ownedCount)
+	w.pendingStore = true
 	shouldExpunge := w.shouldFlushPendingExpunge()
 	var expungePending imap.UIDSet
 	var expungeCmd *imapclient.ExpungeCommand
 	useUIDExpunge := c.Caps().Has(imap.CapUIDPlus) || c.Caps().Has(imap.CapIMAP4rev2)
 	if shouldExpunge {
-		// Snapshot the current pending set; clear w.pendingExpunge so
-		// later cycles don't double-expunge the same UIDs if we get
-		// interleaved.
 		expungePending = w.pendingExpunge
-		w.pendingExpunge = imap.UIDSet{}
-		w.pendingCount = 0
-		w.lastExpunge = time.Now()
 		if useUIDExpunge {
 			expungeCmd = c.UIDExpunge(expungePending)
 		} else {
@@ -892,8 +916,12 @@ func (w *Watcher) finishProcessRange(c *imapclient.Client, res processResult, di
 
 	storeStart := time.Now()
 	if err := storeCmd.Close(); err != nil {
+		if expungeCmd != nil {
+			_, _ = expungeCmd.Collect()
+		}
 		return res.maxUID, fmt.Errorf("store \\Deleted: %w", err)
 	}
+	w.pendingStore = false
 	storeElapsed := time.Since(storeStart)
 	var expungeElapsed time.Duration
 	if expungeCmd != nil {
@@ -901,6 +929,7 @@ func (w *Watcher) finishProcessRange(c *imapclient.Client, res processResult, di
 		if _, err := expungeCmd.Collect(); err != nil {
 			return res.maxUID, fmt.Errorf("expunge: %w", err)
 		}
+		w.clearPendingExpunge()
 		expungeElapsed = time.Since(expungeStart)
 	}
 	if tlog.Enabled(tlog.LevelTrace) {
@@ -944,13 +973,51 @@ func (w *Watcher) shouldFlushPendingExpunge() bool {
 	if w.pendingCount >= w.cfg.LazyExpungeThreshold() {
 		return true
 	}
-	if w.lastExpunge.IsZero() {
-		// Don't let the very first cycle skip — install a baseline so
-		// the age check is meaningful next time.
-		w.lastExpunge = time.Now()
-		return false
+	return !w.pendingSince.IsZero() && !w.now().Before(w.pendingSince.Add(w.cfg.LazyExpungeMaxAge()))
+}
+
+func (w *Watcher) now() time.Time {
+	if w.clock != nil {
+		return w.clock()
 	}
-	return time.Since(w.lastExpunge) >= w.cfg.LazyExpungeMaxAge()
+	return time.Now()
+}
+
+func (w *Watcher) addPendingExpunge(uids imap.UIDSet, count int) {
+	if w.pendingCount == 0 {
+		w.pendingSince = w.now()
+	}
+	w.pendingExpunge.AddSet(uids)
+	w.pendingCount += count
+}
+
+func (w *Watcher) clearPendingExpunge() {
+	w.pendingExpunge = imap.UIDSet{}
+	w.pendingCount = 0
+	w.pendingSince = time.Time{}
+	w.pendingStore = false
+	w.lastExpunge = w.now()
+}
+
+func (w *Watcher) resetPendingGeneration(validity uint32) {
+	if w.pendingValidity != validity {
+		w.clearPendingExpunge()
+	}
+	w.pendingValidity = validity
+}
+
+func (w *Watcher) waitInterval() time.Duration {
+	interval := w.cfg.PollInterval()
+	if w.activeNow() {
+		interval = w.cfg.ActivePollInterval()
+		for count := 0; count < w.emptyPolls && interval < w.cfg.PollInterval(); count++ {
+			interval = min(w.cfg.PollInterval(), interval*2)
+		}
+	}
+	if w.pendingCount > 0 && !w.pendingSince.IsZero() {
+		interval = min(interval, max(0, w.pendingSince.Add(w.cfg.LazyExpungeMaxAge()).Sub(w.now())))
+	}
+	return interval
 }
 
 // flushPendingExpunge forces an EXPUNGE of every UID currently pending,
@@ -967,9 +1034,12 @@ func (w *Watcher) flushPendingExpunge() error {
 		return nil
 	}
 	pending := w.pendingExpunge
-	w.pendingExpunge = imap.UIDSet{}
-	w.pendingCount = 0
-	w.lastExpunge = time.Now()
+	if w.pendingStore {
+		if err := c.Store(pending, &imap.StoreFlags{Op: imap.StoreFlagsAdd, Silent: true, Flags: []imap.Flag{imap.FlagDeleted}}, nil).Close(); err != nil {
+			return fmt.Errorf("retry store: %w", err)
+		}
+		w.pendingStore = false
+	}
 	if c.Caps().Has(imap.CapUIDPlus) || c.Caps().Has(imap.CapIMAP4rev2) {
 		if _, err := c.UIDExpunge(pending).Collect(); err != nil {
 			return fmt.Errorf("uid expunge: %w", err)
@@ -979,6 +1049,7 @@ func (w *Watcher) flushPendingExpunge() error {
 			return fmt.Errorf("expunge: %w", err)
 		}
 	}
+	w.clearPendingExpunge()
 	return nil
 }
 
@@ -996,6 +1067,8 @@ func (w *Watcher) flushPendingExpunge() error {
 // without new mail (e.g. from a kick after this side sent something).
 // Using a numeric upper bound suppresses the RFC-mandated range swap.
 func (w *Watcher) fetchAndProcess(ctx context.Context) error {
+	w.fetchCycles.Add(1)
+	before := w.framesReceived.Load()
 	uidSet := imap.UIDSet{}
 	uidSet.AddRange(w.lastUID+1, 0xFFFFFFFF)
 	maxUID, err := w.processRange(ctx, uidSet, true)
@@ -1010,7 +1083,23 @@ func (w *Watcher) fetchAndProcess(ctx context.Context) error {
 			return err
 		}
 	}
+	if w.framesReceived.Load() > before {
+		w.emptyPolls = 0
+	} else if w.emptyPolls < 30 {
+		w.emptyPolls++
+	}
 	return nil
+}
+
+type WatcherMetrics struct {
+	FetchCycles  uint64 `json:"fetch_cycles"`
+	NoopCommands uint64 `json:"noop_commands"`
+	IdleCommands uint64 `json:"idle_commands"`
+	KickWakeups  uint64 `json:"kick_wakeups"`
+}
+
+func (w *Watcher) Metrics() WatcherMetrics {
+	return WatcherMetrics{FetchCycles: w.fetchCycles.Load(), NoopCommands: w.noopCount.Load(), IdleCommands: w.idleCount.Load(), KickWakeups: w.kickCount.Load()}
 }
 
 func (w *Watcher) consistencyOverlapRange() (imap.UIDSet, bool) {

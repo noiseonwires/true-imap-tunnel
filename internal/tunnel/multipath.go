@@ -4,8 +4,10 @@ package tunnel
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,6 +58,7 @@ type Multipath struct {
 	wg    sync.WaitGroup
 	async map[uint32]*asyncSends
 	ctx   context.Context
+	clock func() time.Time
 
 	OnAsyncSendError func(protocol.Frame, error)
 }
@@ -91,6 +94,7 @@ func NewMultipath(cfg *config.Config, handler imappkg.FrameHandler, filter imapp
 			w.SubjectClientID = cfg.ClientID
 		}
 		m.watchers = append(m.watchers, w)
+		s.OnBatchAppended = w.Kick
 	}
 	return m
 }
@@ -115,6 +119,41 @@ func (m *Multipath) Start(ctx context.Context) {
 			w.Run(ctx)
 		}()
 	}
+	if m.cfg.Mode == config.ModeClient && m.cfg.PingEnabled() && !m.cfg.PingPeriodic() {
+		m.wg.Add(1)
+		go func() { defer m.wg.Done(); m.recoverPaths(ctx) }()
+	}
+}
+
+func (m *Multipath) recoverPaths(ctx context.Context) {
+	ticker := time.NewTicker(provenReconnectGrace)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		m.probeUnprovenPaths()
+	}
+}
+
+func (m *Multipath) probeUnprovenPaths() {
+	for index, sender := range m.senders {
+		if !sender.Connected() || !m.ReceiveReady(index) || m.proven(index) || !sender.ThrottledUntil().IsZero() {
+			continue
+		}
+		payload := make([]byte, 8)
+		binary.BigEndian.PutUint64(payload, uint64(time.Now().UnixNano()))
+		_ = m.SendVia(index, protocol.Frame{Type: protocol.MsgPing, StreamID: protocol.MakeStreamID(m.cfg.ClientID, 0), Payload: payload})
+	}
+}
+
+func (m *Multipath) now() time.Time {
+	if m.clock != nil {
+		return m.clock()
+	}
+	return time.Now()
 }
 
 // Wait blocks until every goroutine started by Start has returned.
@@ -139,22 +178,14 @@ func (m *Multipath) KickWatchers() {
 // stable for the common transient-failure case.
 const provenReconnectGrace = 60 * time.Second
 
-// proven reports whether the account at index idx has shown signs of
-// life recently. The primary signal is the paired watcher's
-// FramesReceived counter, which proves the path is fully bidirectional
-// on the current connection. As a secondary, sticky signal we also
-// accept LastFrameAt within provenReconnectGrace \u2014 this avoids a
-// routing flap each time the watcher reconnects (FramesReceived resets
-// to 0, but LastFrameAt persists).
+// proven reports recent receive evidence, retaining the existing reconnect
+// grace without treating one historical response as permanent proof.
 func (m *Multipath) proven(idx int) bool {
 	if idx < 0 || idx >= len(m.watchers) {
 		return false
 	}
 	w := m.watchers[idx]
-	if w.FramesReceived() > 0 {
-		return true
-	}
-	if last := w.LastFrameAt(); !last.IsZero() && time.Since(last) < provenReconnectGrace {
+	if last := w.LastFrameAt(); !last.IsZero() && m.now().Sub(last) < provenReconnectGrace {
 		return true
 	}
 	return false
@@ -238,6 +269,7 @@ func (m *Multipath) Send(f protocol.Frame) error {
 	if start < 0 {
 		start = int(m.rrCounter.Add(1)-1) % n
 	}
+	order := m.rankedPaths(start)
 
 	useProvenFilter := m.anyProven()
 	preferIdle := m.idleProvenAvailable()
@@ -246,13 +278,12 @@ func (m *Multipath) Send(f protocol.Frame) error {
 
 	if routeIdx >= 0 && routeIdx < n {
 		s := m.senders[routeIdx]
-		if s.Connected() && (!preferIdle || m.idleSupported(routeIdx)) {
+		if s.Connected() && m.normalEligible(routeIdx) && (!preferIdle || m.idleSupported(routeIdx)) {
 			triedRoute = true
 			if err := m.sendOn(s, f); err != nil {
 				tlog.Warnf("multipath: routed sender %s failed: %v", s.Label(), err)
 				lastErr = err
 			} else {
-				m.KickWatchers()
 				return nil
 			}
 		}
@@ -260,13 +291,15 @@ func (m *Multipath) Send(f protocol.Frame) error {
 
 	// Tier 1: proven + connected (or all connected when nothing is
 	// proven yet).
-	for i := 0; i < n; i++ {
-		idx := (start + i) % n
+	for _, idx := range order {
 		if triedRoute && idx == routeIdx {
 			continue
 		}
 		s := m.senders[idx]
 		if !s.Connected() {
+			continue
+		}
+		if !m.normalEligible(idx) {
 			continue
 		}
 		if useProvenFilter && !m.proven(idx) {
@@ -280,20 +313,18 @@ func (m *Multipath) Send(f protocol.Frame) error {
 			lastErr = err
 			continue
 		}
-		m.KickWatchers()
 		return nil
 	}
 
 	// If every preferred IDLE-capable path failed, fall back to proven
 	// non-IDLE paths rather than dropping traffic.
 	if preferIdle {
-		for i := 0; i < n; i++ {
-			idx := (start + i) % n
+		for _, idx := range order {
 			if triedRoute && idx == routeIdx {
 				continue
 			}
 			s := m.senders[idx]
-			if !s.Connected() || !m.proven(idx) || m.idleSupported(idx) {
+			if !s.Connected() || !m.normalEligible(idx) || !m.proven(idx) || m.idleSupported(idx) {
 				continue
 			}
 			if err := m.sendOn(s, f); err != nil {
@@ -301,7 +332,6 @@ func (m *Multipath) Send(f protocol.Frame) error {
 				lastErr = err
 				continue
 			}
-			m.KickWatchers()
 			return nil
 		}
 	}
@@ -310,13 +340,12 @@ func (m *Multipath) Send(f protocol.Frame) error {
 	// account WAS proven (so useProvenFilter is true) but the
 	// proven ones all failed.
 	if useProvenFilter {
-		for i := 0; i < n; i++ {
-			idx := (start + i) % n
+		for _, idx := range order {
 			if triedRoute && idx == routeIdx {
 				continue
 			}
 			s := m.senders[idx]
-			if !s.Connected() || m.proven(idx) {
+			if !s.Connected() || !m.normalEligible(idx) || m.proven(idx) {
 				continue
 			}
 			if err := m.sendOn(s, f); err != nil {
@@ -325,14 +354,21 @@ func (m *Multipath) Send(f protocol.Frame) error {
 				lastErr = err
 				continue
 			}
-			m.KickWatchers()
 			return nil
 		}
 	}
 
+	for _, idx := range order {
+		if m.senders[idx].Connected() && !m.normalEligible(idx) && !(triedRoute && idx == routeIdx) {
+			if err := m.sendOn(m.senders[idx], f); err != nil {
+				lastErr = err
+			} else {
+				return nil
+			}
+		}
+	}
 	// Tier 3: disconnected senders may have completed backoff.
-	for i := 0; i < n; i++ {
-		idx := (start + i) % n
+	for _, idx := range order {
 		if triedRoute && idx == routeIdx {
 			continue
 		}
@@ -344,7 +380,6 @@ func (m *Multipath) Send(f protocol.Frame) error {
 			lastErr = err
 			continue
 		}
-		m.KickWatchers()
 		return nil
 	}
 
@@ -364,10 +399,10 @@ func (m *Multipath) sendFrameRoundRobin(f protocol.Frame) (error, bool) {
 	var lastErr error
 	tried := false
 
-	for i := 0; i < n; i++ {
-		idx := (start + i) % n
+	for offset := 0; offset < n; offset++ {
+		idx := (start + offset) % n
 		s := m.senders[idx]
-		if !s.Connected() || !m.proven(idx) {
+		if !s.Connected() || !m.normalEligible(idx) || !m.proven(idx) {
 			continue
 		}
 		if preferIdle && !m.idleSupported(idx) {
@@ -379,7 +414,6 @@ func (m *Multipath) sendFrameRoundRobin(f protocol.Frame) (error, bool) {
 			lastErr = err
 			continue
 		}
-		m.KickWatchers()
 		return nil, true
 	}
 	if tried && lastErr != nil {
@@ -430,9 +464,10 @@ func (m *Multipath) AllocRoute(streamID uint32) int {
 	useProvenFilter := m.anyProven()
 	preferIdle := m.idleProvenAvailable()
 
-	for i := 0; i < n; i++ {
-		idx := (start + i) % n
+	order := m.rankedPaths(start)
+	for _, idx := range order {
 		if m.senders[idx].Connected() &&
+			m.normalEligible(idx) &&
 			(!useProvenFilter || m.proven(idx)) &&
 			(!preferIdle || m.idleSupported(idx)) {
 			m.routes.Store(streamID, idx)
@@ -440,9 +475,8 @@ func (m *Multipath) AllocRoute(streamID uint32) int {
 		}
 	}
 	if preferIdle {
-		for i := 0; i < n; i++ {
-			idx := (start + i) % n
-			if m.senders[idx].Connected() && (!useProvenFilter || m.proven(idx)) {
+		for _, idx := range order {
+			if m.senders[idx].Connected() && m.normalEligible(idx) && (!useProvenFilter || m.proven(idx)) {
 				m.routes.Store(streamID, idx)
 				return idx
 			}
@@ -453,15 +487,15 @@ func (m *Multipath) AllocRoute(streamID uint32) int {
 	// control probes through every account; only paths that answer
 	// should enter normal stream rotation.
 	if !useProvenFilter {
-		for idx, s := range m.senders {
+		for _, idx := range order {
+			s := m.senders[idx]
 			if s.Connected() {
 				m.routes.Store(streamID, idx)
 				return idx
 			}
 		}
 	} else {
-		for i := 0; i < n; i++ {
-			idx := (start + i) % n
+		for _, idx := range order {
 			if m.senders[idx].Connected() {
 				m.routes.Store(streamID, idx)
 				return idx
@@ -470,6 +504,61 @@ func (m *Multipath) AllocRoute(streamID uint32) int {
 	}
 	m.routes.Store(streamID, start)
 	return start
+}
+
+type pathCandidate struct {
+	index     int
+	connected bool
+	ready     bool
+	throttled bool
+	proven    bool
+	idle      bool
+	work      float64
+}
+
+func rankCandidates(candidates []pathCandidate) {
+	sort.SliceStable(candidates, func(left, right int) bool {
+		first, second := candidates[left], candidates[right]
+		for _, pair := range [][2]bool{{first.connected, second.connected}, {!first.throttled, !second.throttled}, {first.ready, second.ready}, {first.proven, second.proven}, {first.idle && first.proven, second.idle && second.proven}} {
+			if pair[0] != pair[1] {
+				return pair[0]
+			}
+		}
+		return first.work < second.work
+	})
+}
+
+func (m *Multipath) rankedPaths(start int) []int {
+	candidates := make([]pathCandidate, 0, len(m.senders))
+	for offset := range m.senders {
+		index := (start + offset) % len(m.senders)
+		sender := m.senders[index]
+		metrics := sender.Metrics()
+		latency := float64(metrics.AppendEWMANanoseconds)
+		if latency <= 0 {
+			latency = float64(100 * time.Millisecond)
+		}
+		work := latency * (1 + float64(metrics.OutstandingBytes)/float64(m.cfg.BatchMaxBytes()))
+		candidates = append(candidates, pathCandidate{index: index, connected: sender.Connected(), ready: m.ReceiveReady(index), throttled: !sender.ThrottledUntil().IsZero(), proven: m.proven(index), idle: m.idleSupported(index), work: work})
+	}
+	rankCandidates(candidates)
+	order := make([]int, len(candidates))
+	for index, candidate := range candidates {
+		order[index] = candidate.index
+	}
+	return order
+}
+
+func (m *Multipath) normalEligible(index int) bool {
+	if m.ReceiveReady(index) && m.senders[index].ThrottledUntil().IsZero() {
+		return true
+	}
+	for other, sender := range m.senders {
+		if sender.Connected() && m.ReceiveReady(other) && sender.ThrottledUntil().IsZero() {
+			return false
+		}
+	}
+	return true
 }
 
 // PinByLabel records a route for streamID using the account with the
@@ -673,9 +762,6 @@ func (m *Multipath) SendVia(idx int, f protocol.Frame) error {
 		return ErrNoSenders
 	}
 	err := m.sendOn(m.senders[idx], f)
-	if err == nil {
-		m.KickWatchers()
-	}
 	return err
 }
 

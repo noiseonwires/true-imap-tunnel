@@ -348,16 +348,21 @@ func extractFrame(rawMessage []byte) ([]byte, error) {
 		return nil, errors.New("malformed message: no header/body separator")
 	}
 	body := rawMessage[sep:]
-	// Strip all whitespace from base64 body before decoding.
-	body = stripASCIIWhitespace(body)
+	if bytes.IndexAny(body, " \t") >= 0 {
+		body = stripASCIIWhitespace(body)
+	}
 	if len(body) == 0 {
 		return nil, errors.New("empty message body")
 	}
-	out, err := base64.StdEncoding.DecodeString(string(body))
+	out := make([]byte, base64.StdEncoding.DecodedLen(len(body)))
+	count, err := base64.StdEncoding.Decode(out, body)
 	if err != nil {
 		return nil, fmt.Errorf("base64 decode: %w", err)
 	}
-	return out, nil
+	if count == 0 {
+		return nil, errors.New("empty message body")
+	}
+	return out[:count], nil
 }
 
 func findHeaderBodySeparator(b []byte) int {

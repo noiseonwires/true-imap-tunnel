@@ -135,6 +135,9 @@ func (t *Tunnel) runControls(ctx context.Context) {
 			if reply.label == "" {
 				err = t.streams.SendFrame(reply.frame)
 			} else {
+				if reply.frame.Type == protocol.MsgRst {
+					t.sentResets.Add(1)
+				}
 				err = t.paths.SendViaLabel(reply.label, reply.frame)
 			}
 			if err != nil && ctx.Err() == nil {

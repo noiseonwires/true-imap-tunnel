@@ -2,6 +2,7 @@ package imap
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 	"time"
 
@@ -73,6 +74,36 @@ func TestBuildAndExtractFrameRoundTrip(t *testing.T) {
 				t.Errorf("payload mismatch")
 			}
 		})
+	}
+}
+
+func BenchmarkExtractFrame(b *testing.B) {
+	for _, size := range []int{64, 32768, 262144} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			message, err := buildMessage(bytes.Repeat([]byte{0x42}, size), time.Now(), defaultMessageOptions())
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				if _, err := extractFrame(message); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestExtractFrameWhitespaceCompatibility(t *testing.T) {
+	for _, body := range []string{"aGVsbG8=", "aG\r\nVsbG8=\r\n", " aG\tVs\n bG8= "} {
+		message := []byte("Subject: x\r\n\r\n" + body)
+		original := append([]byte(nil), message...)
+		decoded, err := extractFrame(message)
+		if err != nil || string(decoded) != "hello" || !bytes.Equal(message, original) {
+			t.Fatalf("body=%q decoded=%q err=%v", body, decoded, err)
+		}
 	}
 }
 

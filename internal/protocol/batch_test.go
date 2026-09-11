@@ -2,6 +2,8 @@ package protocol
 
 import (
 	"bytes"
+	"encoding/binary"
+	"fmt"
 	"testing"
 )
 
@@ -95,5 +97,45 @@ func TestIsBatch(t *testing.T) {
 	}
 	if IsBatch(nil) {
 		t.Errorf("IsBatch(nil)")
+	}
+}
+
+func BenchmarkEncodeBatch(b *testing.B) {
+	for _, size := range []int{64, 32768} {
+		for _, count := range []int{1, 8, 64} {
+			b.Run(fmt.Sprintf("bytes=%d/frames=%d", size, count), func(b *testing.B) {
+				frames := make([]Frame, count)
+				for index := range frames {
+					frames[index] = Frame{Type: MsgData, StreamID: 1, SeqID: uint32(index + 1), Payload: bytes.Repeat([]byte{0x42}, size)}
+				}
+				b.SetBytes(int64(size * count))
+				b.ReportAllocs()
+				b.ResetTimer()
+				for iteration := 0; iteration < b.N; iteration++ {
+					if _, err := EncodeBatch(frames); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestEncodeBatchWireCompatibility(t *testing.T) {
+	for _, size := range []int{0, 1, 64, 32768} {
+		frames := []Frame{{Type: MsgOpen, StreamID: 0x07010203, SeqID: 1}, {Type: MsgData, StreamID: 0x07010203, SeqID: 2, Payload: bytes.Repeat([]byte{0x42}, size)}}
+		var expected bytes.Buffer
+		expected.Write([]byte{0xBA, 0, 2})
+		for _, frame := range frames {
+			_ = binary.Write(&expected, binary.BigEndian, uint32(9+len(frame.Payload)))
+			expected.WriteByte(frame.Type)
+			_ = binary.Write(&expected, binary.BigEndian, frame.StreamID)
+			_ = binary.Write(&expected, binary.BigEndian, frame.SeqID)
+			expected.Write(frame.Payload)
+		}
+		actual, err := EncodeBatch(frames)
+		if err != nil || !bytes.Equal(actual, expected.Bytes()) {
+			t.Fatalf("legacy wire mismatch for %d bytes: %v", size, err)
+		}
 	}
 }

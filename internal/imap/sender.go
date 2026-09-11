@@ -57,6 +57,8 @@ type Sender struct {
 
 	sentCount  atomic.Uint64
 	batchCount atomic.Uint64
+	metricsMu  sync.Mutex
+	metrics    SenderMetrics
 
 	connected     atomic.Bool
 	connects      atomic.Uint64
@@ -80,6 +82,7 @@ type Sender struct {
 	// stream instead of silently dropping bytes and leaving the peer's
 	// reorder buffer waiting for a missing SeqID.
 	AsyncErrorHandler func(protocol.Frame, error)
+	OnBatchAppended   func()
 
 	appendHook func([]byte) error
 	runCtx     context.Context
@@ -103,6 +106,50 @@ type sendReq struct {
 	reply    chan error
 	complete func(error)
 	ctx      context.Context
+	queuedAt time.Time
+	started  bool
+}
+
+type SenderMetrics struct {
+	OutstandingFrames     int64  `json:"outstanding_frames"`
+	OutstandingBytes      int64  `json:"outstanding_bytes"`
+	AppendAttempts        uint64 `json:"append_attempts"`
+	AppendFailures        uint64 `json:"append_failures"`
+	AppendNanoseconds     int64  `json:"append_nanoseconds"`
+	AppendEWMANanoseconds int64  `json:"append_ewma_nanoseconds"`
+	QueueNanoseconds      int64  `json:"queue_nanoseconds"`
+	CompletedFrames       uint64 `json:"completed_frames"`
+	PayloadBytes          uint64 `json:"payload_bytes"`
+	WireBytes             uint64 `json:"wire_bytes"`
+}
+
+func (s *Sender) Metrics() SenderMetrics {
+	s.metricsMu.Lock()
+	defer s.metricsMu.Unlock()
+	return s.metrics
+}
+
+func (s *Sender) trackRequest(request *sendReq) {
+	request.queuedAt = time.Now()
+	s.metricsMu.Lock()
+	s.metrics.OutstandingFrames++
+	s.metrics.OutstandingBytes += int64(protocol.HeaderSize + len(request.frame.Payload))
+	s.metricsMu.Unlock()
+}
+
+func (s *Sender) finishRequest(request *sendReq) {
+	if request.queuedAt.IsZero() {
+		return
+	}
+	s.metricsMu.Lock()
+	s.metrics.OutstandingFrames--
+	s.metrics.OutstandingBytes -= int64(protocol.HeaderSize + len(request.frame.Payload))
+	s.metrics.CompletedFrames++
+	if !request.started {
+		s.metrics.QueueNanoseconds += time.Since(request.queuedAt).Nanoseconds()
+	}
+	s.metricsMu.Unlock()
+	request.queuedAt = time.Time{}
 }
 
 // NewSender constructs (but does not connect) a Sender. keys may be
@@ -158,9 +205,9 @@ func (s *Sender) ThrottledUntil() time.Time {
 // the latter.
 func (s *Sender) SentCount() uint64 { return s.sentCount.Load() }
 
-// BatchCount returns the total number of APPEND commands issued
-// (regardless of batch size). The ratio SentCount / BatchCount is
-// the average batch size — a useful efficiency metric.
+// BatchCount counts successfully appended batches. Metrics.AppendAttempts
+// also includes unsuccessful attempts. SentCount / BatchCount is the
+// average successful batch size.
 func (s *Sender) BatchCount() uint64 { return s.batchCount.Load() }
 
 // Send enqueues one frame for APPEND and blocks until that frame's
@@ -181,11 +228,14 @@ func (s *Sender) SendContext(ctx context.Context, f protocol.Frame) error {
 		return errSenderStopped
 	default:
 	}
+	s.trackRequest(req)
 	select {
 	case s.queue <- req:
 	case <-ctx.Done():
+		s.finishRequest(req)
 		return ctx.Err()
 	case <-s.done:
+		s.finishRequest(req)
 		return errSenderStopped
 	}
 	select {
@@ -227,12 +277,16 @@ func (s *Sender) EnqueueContext(ctx context.Context, f protocol.Frame, complete 
 		return errSenderStopped
 	default:
 	}
+	request := &sendReq{frame: f, complete: complete, ctx: ctx}
+	s.trackRequest(request)
 	select {
-	case s.queue <- &sendReq{frame: f, complete: complete, ctx: ctx}:
+	case s.queue <- request:
 		return nil
 	case <-ctx.Done():
+		s.finishRequest(request)
 		return ctx.Err()
 	case <-s.done:
+		s.finishRequest(request)
 		return errSenderStopped
 	}
 }
@@ -472,6 +526,20 @@ func (s *Sender) opportunisticDrain(batch []*sendReq) []*sendReq {
 		default:
 		}
 	}
+	if len(batch) == 1 && batch[0].frame.Type == protocol.MsgData {
+		for index, request := range candidates {
+			if !priorityControl(request.frame.Type) {
+				continue
+			}
+			first := batch[0]
+			batch[0] = request
+			copy(candidates[1:index+1], candidates[:index])
+			candidates[0] = first
+			clientID = batchClientID(request.frame)
+			totalBytes = len(request.frame.Payload) + protocol.HeaderSize
+			break
+		}
+	}
 	for index, request := range candidates {
 		candidates[index] = nil
 		if s.dropIfCanceled(request) {
@@ -485,6 +553,10 @@ func (s *Sender) opportunisticDrain(batch []*sendReq) []*sendReq {
 		}
 	}
 	return batch
+}
+
+func priorityControl(kind byte) bool {
+	return kind == protocol.MsgPing || kind == protocol.MsgPong || kind == protocol.MsgRst
 }
 
 func batchClientID(f protocol.Frame) byte {
@@ -503,6 +575,12 @@ func (s *Sender) sendBatch(reqs []*sendReq) {
 	frames := make([]protocol.Frame, len(reqs))
 	for i, r := range reqs {
 		frames[i] = r.frame
+		if !r.queuedAt.IsZero() {
+			s.metricsMu.Lock()
+			s.metrics.QueueNanoseconds += time.Since(r.queuedAt).Nanoseconds()
+			s.metricsMu.Unlock()
+			r.started = true
+		}
 	}
 
 	var encoded []byte
@@ -563,6 +641,16 @@ func (s *Sender) sendBatch(reqs []*sendReq) {
 
 	s.sentCount.Add(uint64(len(reqs)))
 	s.batchCount.Add(1)
+	s.metricsMu.Lock()
+	for _, frame := range frames {
+		if frame.Type == protocol.MsgData {
+			s.metrics.PayloadBytes += uint64(len(frame.Payload))
+		}
+	}
+	s.metricsMu.Unlock()
+	if s.OnBatchAppended != nil {
+		s.OnBatchAppended()
+	}
 	if tlog.Enabled(tlog.LevelTrace) {
 		tlog.Tracef("sender %s: tx batch frames=%d body=%dB elapsed=%v (avg %dB/frame)",
 			s.acc.Label(), len(reqs), len(body),
@@ -606,7 +694,10 @@ func (s *Sender) dropIfCanceled(r *sendReq) bool {
 		return false
 	}
 	if r.reply != nil {
+		s.finishRequest(r)
 		r.reply <- errStreamCanceled
+	} else {
+		s.finishRequest(r)
 	}
 	if r.complete != nil {
 		r.complete(errStreamCanceled)
@@ -676,7 +767,21 @@ func (s *Sender) appendWithRetryLocked(ctx context.Context, body []byte, opts *i
 		if client := s.client; client != nil {
 			stop = context.AfterFunc(ctx, func() { _ = client.Close() })
 		}
+		started := time.Now()
 		err := s.appendOnceLocked(body, opts)
+		elapsed := time.Since(started).Nanoseconds()
+		s.metricsMu.Lock()
+		s.metrics.AppendAttempts++
+		s.metrics.WireBytes += uint64(len(body))
+		s.metrics.AppendNanoseconds += elapsed
+		if err != nil {
+			s.metrics.AppendFailures++
+		} else if s.metrics.AppendEWMANanoseconds == 0 {
+			s.metrics.AppendEWMANanoseconds = elapsed
+		} else {
+			s.metrics.AppendEWMANanoseconds += (elapsed - s.metrics.AppendEWMANanoseconds) / 8
+		}
+		s.metricsMu.Unlock()
 		stop()
 		if err != nil {
 			lastErr = err
@@ -784,6 +889,7 @@ func (s *Sender) drainPendingWithError(err error) {
 // reply channel.
 func (s *Sender) replyAll(reqs []*sendReq, err error) {
 	for _, r := range reqs {
+		s.finishRequest(r)
 		if r.complete != nil {
 			r.complete(err)
 		}

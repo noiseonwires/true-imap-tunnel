@@ -7,12 +7,14 @@ package tunnel
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,11 +46,11 @@ func init() {
 
 // startMemIMAP launches an in-memory IMAP server with one user and the
 // folders our tunnel will use, then returns its address.
-func startMemIMAP(t *testing.T) string {
+func startMemIMAP(t testing.TB) string {
 	return startMemIMAPWithFault(t, nil)
 }
 
-func startMemIMAPWithFault(t *testing.T, drop *atomic.Bool) string {
+func startMemIMAPWithFault(t testing.TB, drop *atomic.Bool) string {
 	var hook func(string, net.Conn)
 	if drop != nil {
 		hook = func(mailbox string, conn net.Conn) {
@@ -60,7 +62,7 @@ func startMemIMAPWithFault(t *testing.T, drop *atomic.Bool) string {
 	return startMemIMAPWithAppendHook(t, hook)
 }
 
-func startMemIMAPWithAppendHook(t *testing.T, hook func(string, net.Conn)) string {
+func startMemIMAPWithAppendHook(t testing.TB, hook func(string, net.Conn)) string {
 	t.Helper()
 
 	memSrv := imapmemserver.New()
@@ -162,10 +164,402 @@ func TestEndToEnd_AmbiguousOpenAppend(t *testing.T) {
 	if err != nil || string(body) != "exactly once" || !dropped.Load() || dials.Load() != 1 {
 		t.Fatalf("body=%q err=%v dropped=%v dials=%d", body, err, dropped.Load(), dials.Load())
 	}
+	metrics := client.paths.senders[0].Metrics()
+	if metrics.AppendFailures < 1 || metrics.AppendAttempts <= client.paths.senders[0].BatchCount() {
+		t.Fatalf("missing retry diagnostics: %+v", metrics)
+	}
+}
+
+func TestStatusTransportMetricsSnapshot(t *testing.T) {
+	tun := mustNew(t, &config.Config{Mode: config.ModeClient, EncryptionPassphrase: "secret-key-marker", Accounts: []config.AccountConfig{{Name: "test", Password: "secret-password-marker", OAuth2Token: "secret-token-marker"}}})
+	encoded, err := json.Marshal(tun.StatusSnapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"secret-key-marker", "secret-password-marker", "secret-token-marker"} {
+		if strings.Contains(string(encoded), secret) {
+			t.Fatal("secret in status")
+		}
+	}
+	if !strings.Contains(string(encoded), "sender_metrics") || !strings.Contains(string(encoded), "watcher_metrics") {
+		t.Fatal("transport metrics absent")
+	}
+}
+
+func TestRouteRankingAndTargetedKicks(t *testing.T) {
+	ready := pathCandidate{index: 1, connected: true, ready: true, proven: true, idle: true, work: 100}
+	for _, other := range []pathCandidate{
+		{index: 2, connected: true, ready: true, proven: true, idle: true, work: 1000},
+		{index: 2, connected: true, ready: false, proven: true, idle: true, work: 1},
+		{index: 2, connected: true, ready: true, throttled: true, proven: true, idle: true, work: 1},
+		{index: 2, connected: true, ready: true, proven: false, idle: true, work: 1},
+	} {
+		candidates := []pathCandidate{other, ready}
+		rankCandidates(candidates)
+		if candidates[0].index != 1 {
+			t.Fatalf("wrong preferred path: %+v", candidates)
+		}
+	}
+	paths := NewMultipath(&config.Config{Accounts: []config.AccountConfig{{Name: "A"}, {Name: "B"}}}, nil, nil, nil)
+	paths.senders[0].OnBatchAppended()
+	if paths.watchers[0].Metrics().KickWakeups != 1 || paths.watchers[1].Metrics().KickWakeups != 0 {
+		t.Fatal("APPEND woke unrelated path")
+	}
+}
+
+func TestLoadAwareRoutePreservesAffinityAndOnlyPath(t *testing.T) {
+	addr := startMemIMAP(t)
+	paths := NewMultipath(&config.Config{Accounts: []config.AccountConfig{makeAccount(addr, "Tunnel.C2S", "Tunnel.S2C"), makeAccountUser(addr, "tit2", "tit-pass2", "Tunnel.C2S", "Tunnel.S2C")}}, func(protocol.Frame, string) {}, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	paths.Start(ctx)
+	defer func() { cancel(); paths.Wait() }()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for !paths.AllConnected() || !paths.ReceiveReady(0) || !paths.ReceiveReady(1) {
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			t.Fatal("paths not ready")
+		}
+	}
+	paths.routes.Store(uint32(7), 0)
+	paths.senders[0].CancelStream(99)
+	before := paths.senders[0].SentCount()
+	if err := paths.Send(protocol.Frame{Type: protocol.MsgPing, StreamID: 7, Payload: []byte("affinity")}); err != nil {
+		t.Fatal(err)
+	}
+	if paths.RouteLabel(7) != paths.senders[0].Label() || paths.senders[0].SentCount() != before+1 {
+		t.Fatalf("affinity route=%q want=%q counts=%v before=%d", paths.RouteLabel(7), paths.senders[0].Label(), paths.SenderSentCounts(), before)
+	}
+	paths.senders = paths.senders[:1]
+	paths.watchers = paths.watchers[:1]
+	if paths.AllocRoute(8) != 0 {
+		t.Fatal("only usable path rejected")
+	}
+	if err := paths.Send(protocol.Frame{Type: protocol.MsgPing, StreamID: 8, Payload: []byte("only")}); err != nil {
+		t.Fatalf("only path rejected: %v", err)
+	}
+}
+
+func TestNewRouteChoosesLowerQueuedWork(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	addr := startMemIMAPWithAppendHook(t, func(string, net.Conn) { once.Do(func() { close(started); <-release }) })
+	paths := NewMultipath(&config.Config{Accounts: []config.AccountConfig{makeAccount(addr, "Tunnel.C2S", "Tunnel.S2C"), makeAccountUser(addr, "tit2", "tit-pass2", "Tunnel.C2S", "Tunnel.S2C")}}, func(protocol.Frame, string) {}, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	paths.Start(ctx)
+	defer func() { cancel(); paths.Wait() }()
+	defer close(release)
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for !paths.AllConnected() || !paths.ReceiveReady(0) || !paths.ReceiveReady(1) {
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			t.Fatal("paths not ready")
+		}
+	}
+	paths.routes.Store(uint32(7), 0)
+	for count := 0; count < 12; count++ {
+		if err := paths.senders[0].Enqueue(protocol.Frame{Type: protocol.MsgData, StreamID: 99, Payload: make([]byte, 32768)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-started:
+	case <-deadline.C:
+		t.Fatal("busy APPEND not started")
+	}
+	if got := paths.AllocRoute(8); got != 1 {
+		t.Fatalf("selected loaded path=%d metrics=%+v", got, paths.senders[0].Metrics())
+	}
+	if paths.RouteLabel(7) != paths.senders[0].Label() {
+		t.Fatal("new allocation moved existing affinity")
+	}
+}
+
+func TestPathProofExpiresAndRecovers(t *testing.T) {
+	addr := startMemIMAP(t)
+	cfg := &config.Config{Mode: config.ModeClient, Listen: freePort(t), PingIntervalMs: -1, Accounts: []config.AccountConfig{makeAccount(addr, "Tunnel.C2S", "Tunnel.S2C")}}
+	server := mustNew(t, &config.Config{Mode: config.ModeServer, Target: startEchoServer(t), Accounts: []config.AccountConfig{makeAccount(addr, "Tunnel.S2C", "Tunnel.C2S")}})
+	client := mustNew(t, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() { defer workers.Done(); _ = client.Run(ctx) }()
+	go func() { defer workers.Done(); _ = server.Run(ctx) }()
+	defer func() { cancel(); workers.Wait() }()
+	waitForTransport(t, client, server)
+	if err := client.paths.SendVia(0, protocol.Frame{Type: protocol.MsgPing, Payload: []byte("probe")}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for client.paths.ProvenCount() == 0 {
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			t.Fatal("probe failed")
+		}
+	}
+	expiredAt := client.paths.watchers[0].LastFrameAt().Add(provenReconnectGrace + time.Nanosecond)
+	client.paths.clock = func() time.Time { return expiredAt }
+	if client.paths.ProvenCount() != 0 {
+		t.Fatal("proof never expired")
+	}
+	client.paths.probeUnprovenPaths()
+	for client.paths.ProvenCount() != 1 {
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			t.Fatal("fresh recovery response did not restore proof")
+		}
+	}
+}
+
+func BenchmarkTunnelBulkTransfer(b *testing.B) {
+	for _, count := range []int{1, 8} {
+		for _, accounts := range []int{1, 2} {
+			for _, delay := range []time.Duration{0, 50 * time.Millisecond, 100 * time.Millisecond} {
+				for _, async := range []bool{false, true} {
+					for _, mode := range []config.MultipathMode{config.MultipathModeStreamAffinity, config.MultipathModeFrameRoundRobin} {
+						b.Run(fmt.Sprintf("streams=%d/accounts=%d/delay=%s/async=%v/%s", count, accounts, delay, async, mode), func(b *testing.B) {
+							client, server, conns := benchmarkTunnel(b, count, accounts, delay, async, mode)
+							payload := strings.Repeat("b", (8*1024*1024)/count)
+							before := client.paths.senders[0].Metrics().AppendAttempts
+							b.ReportAllocs()
+							b.SetBytes(int64(len(payload) * count))
+							b.ResetTimer()
+							for iteration := 0; iteration < b.N; iteration++ {
+								var transfers sync.WaitGroup
+								failures := make(chan error, count)
+								for _, conn := range conns {
+									transfers.Add(1)
+									go func(conn net.Conn) { defer transfers.Done(); failures <- benchmarkEcho(conn, payload) }(conn)
+								}
+								transfers.Wait()
+								close(failures)
+								for err := range failures {
+									if err != nil {
+										b.Fatal(err)
+									}
+								}
+							}
+							b.StopTimer()
+							b.ReportMetric(float64(client.paths.senders[0].Metrics().AppendAttempts-before)/float64(b.N), "primary-appends/op")
+							_ = server
+						})
+					}
+				}
+			}
+		}
+	}
+}
+
+func benchmarkTunnel(b *testing.B, count, accounts int, delay time.Duration, async bool, mode config.MultipathMode, mixed ...bool) (*Tunnel, *Tunnel, []net.Conn) {
+	b.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	addr := startMemIMAPWithAppendHook(b, func(_ string, _ net.Conn) {
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+			}
+		}
+	})
+	clientCfg := &config.Config{Mode: config.ModeClient, Listen: freePort(b), PingIntervalMs: -1, AsyncDataSend: async, MultipathMode: mode, Accounts: []config.AccountConfig{makeAccount(addr, "Tunnel.C2S", "Tunnel.S2C")}}
+	serverCfg := &config.Config{Mode: config.ModeServer, Target: startEchoServer(b), AsyncDataSend: async, MultipathMode: mode, Accounts: []config.AccountConfig{makeAccount(addr, "Tunnel.S2C", "Tunnel.C2S")}}
+	if accounts == 2 {
+		secondAddr := addr
+		if len(mixed) > 0 && mixed[0] {
+			secondAddr = startMemIMAPWithAppendHook(b, func(string, net.Conn) {
+				timer := time.NewTimer(2 * delay)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+				}
+			})
+		}
+		clientCfg.Accounts = append(clientCfg.Accounts, makeAccountUser(secondAddr, "tit2", "tit-pass2", "Tunnel.C2S", "Tunnel.S2C"))
+		serverCfg.Accounts = append(serverCfg.Accounts, makeAccountUser(secondAddr, "tit2", "tit-pass2", "Tunnel.S2C", "Tunnel.C2S"))
+	}
+	client, server := mustNew(b, clientCfg), mustNew(b, serverCfg)
+	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() { defer workers.Done(); _ = server.Run(ctx) }()
+	go func() { defer workers.Done(); _ = client.Run(ctx) }()
+	var conns []net.Conn
+	b.Cleanup(func() {
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+		cancel()
+		workers.Wait()
+	})
+	waitForTransport(b, client, server)
+	for index := 0; index < accounts; index++ {
+		if err := client.paths.SendVia(index, protocol.Frame{Type: protocol.MsgPing, Payload: make([]byte, 8)}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for client.paths.ProvenCount() != accounts || server.paths.ProvenCount() != accounts {
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			b.Fatal("benchmark proof timeout")
+		}
+	}
+	for index := 0; index < count; index++ {
+		conn, err := net.Dial("tcp", clientCfg.Listen)
+		if err != nil {
+			b.Fatal(err)
+		}
+		conns = append(conns, conn)
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Minute))
+		if err := benchmarkEcho(conn, "warmup"); err != nil {
+			b.Fatal(err)
+		}
+	}
+	return client, server, conns
+}
+
+func benchmarkEcho(conn net.Conn, payload string) error {
+	written := make(chan error, 1)
+	go func() { _, err := io.WriteString(conn, payload); written <- err }()
+	body := make([]byte, len(payload))
+	_, err := io.ReadFull(conn, body)
+	if err != nil {
+		_ = conn.Close()
+	}
+	writeErr := <-written
+	if err != nil {
+		return err
+	}
+	if writeErr != nil {
+		return writeErr
+	}
+	if string(body) != payload {
+		return fmt.Errorf("benchmark payload mismatch")
+	}
+	return nil
+}
+
+func BenchmarkTunnelInteractiveRoundTrip(b *testing.B) {
+	for _, async := range []bool{false, true} {
+		b.Run(fmt.Sprintf("async=%v", async), func(b *testing.B) {
+			_, _, conns := benchmarkTunnel(b, 2, 1, 50*time.Millisecond, async, config.MultipathModeStreamAffinity)
+			done := make(chan struct{})
+			stop := make(chan struct{})
+			go func() {
+				defer close(done)
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					if benchmarkEcho(conns[1], strings.Repeat("bulk", 32768)) != nil {
+						return
+					}
+				}
+			}()
+			defer func() { close(stop); _ = conns[1].Close(); <-done }()
+			latencies := make([]float64, 0, b.N)
+			payload := strings.Repeat("i", 64)
+			b.SetBytes(64)
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				started := time.Now()
+				if err := benchmarkEcho(conns[0], payload); err != nil {
+					b.Fatal(err)
+				}
+				latencies = append(latencies, float64(time.Since(started).Microseconds())/1000)
+			}
+			b.StopTimer()
+			sort.Float64s(latencies)
+			for _, percentile := range []int{50, 95, 99} {
+				b.ReportMetric(latencies[min(len(latencies)-1, (len(latencies)*percentile-1)/100)], fmt.Sprintf("p%d-ms", percentile))
+			}
+		})
+	}
+}
+
+func BenchmarkTunnelMixedPathBulkTransfer(b *testing.B) {
+	for _, async := range []bool{false, true} {
+		b.Run(fmt.Sprintf("async=%v", async), func(b *testing.B) {
+			_, _, conns := benchmarkTunnel(b, 1, 2, 50*time.Millisecond, async, config.MultipathModeFrameRoundRobin, true)
+			payload := strings.Repeat("mixed", 8*1024*1024/5)
+			b.SetBytes(int64(len(payload)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				if err := benchmarkEcho(conns[0], payload); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+		})
+	}
+}
+
+func TestEndToEnd_TargetedKickPreservesFallbackReceive(t *testing.T) {
+	addr := startMemIMAP(t)
+	client := mustNew(t, &config.Config{Mode: config.ModeClient, Listen: freePort(t), DisableIdle: true, PingIntervalMs: -1, PollIntervalMs: 50, Accounts: []config.AccountConfig{makeAccount(addr, "Tunnel.C2S", "Tunnel.S2C"), makeAccountUser(addr, "tit2", "tit-pass2", "Tunnel.C2S", "Tunnel.S2C")}})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = client.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+	waitForTransport(t, client)
+	if err := client.paths.SendVia(0, protocol.Frame{Type: protocol.MsgPing, Payload: []byte("a")}); err != nil {
+		t.Fatal(err)
+	}
+	if client.paths.watchers[1].Metrics().KickWakeups != 0 {
+		t.Fatal("send on A kicked B")
+	}
+	remote, err := imapclient.DialInsecure(addr, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close()
+	if err := remote.Login("tit2", "tit-pass2").Wait(); err != nil {
+		t.Fatal(err)
+	}
+	blob := protocol.Encode(protocol.Frame{Type: protocol.MsgPong, Payload: []byte("fallback")})
+	body := []byte("Subject: fallback\r\n\r\n" + base64.StdEncoding.EncodeToString(blob) + "\r\n")
+	appendCmd := remote.Append("Tunnel.S2C", int64(len(body)), nil)
+	_, _ = appendCmd.Write(body)
+	_ = appendCmd.Close()
+	if _, err := appendCmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for client.paths.watchers[1].FramesReceived() == 0 {
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			t.Fatal("unkicked fallback path did not receive")
+		}
+	}
 }
 
 // startEchoServer starts a tiny TCP echo server and returns its address.
-func startEchoServer(t *testing.T) string {
+func startEchoServer(t testing.TB) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -253,7 +647,7 @@ func makeAccountUser(host, user, pass, sendFolder, recvFolder string) config.Acc
 }
 
 // freePort returns a random TCP address on 127.0.0.1.
-func freePort(t *testing.T) string {
+func freePort(t testing.TB) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -501,7 +895,7 @@ func TestEndToEnd_AmbiguousOpenAppendBatch(t *testing.T) {
 	}
 }
 
-func waitForTransport(t *testing.T, tunnels ...*Tunnel) {
+func waitForTransport(t testing.TB, tunnels ...*Tunnel) {
 	t.Helper()
 	deadline := time.NewTimer(10 * time.Second)
 	defer deadline.Stop()
@@ -711,7 +1105,7 @@ func waitForListen(t *testing.T, addr string, timeout time.Duration, tunnels ...
 // New is fallible (encryption-setup can fail on invalid config), but
 // e2e tests never exercise that path, so the helper keeps test code
 // terse.
-func mustNew(t *testing.T, cfg *config.Config) *Tunnel {
+func mustNew(t testing.TB, cfg *config.Config) *Tunnel {
 	t.Helper()
 	tt, err := New(cfg)
 	if err != nil {

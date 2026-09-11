@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	imappkg "github.com/noiseonwires/true-imap-tunnel/internal/imap"
 	"github.com/noiseonwires/true-imap-tunnel/internal/streams"
 	"time"
 )
@@ -17,26 +18,33 @@ type StatusSnapshot struct {
 	AccountsProven    int                  `json:"accounts_proven"`
 	Accounts          []AccountStatus      `json:"accounts"`
 	ReorderGaps       []streams.ReorderGap `json:"reorder_gaps,omitempty"`
+	OpenCompleted     uint64               `json:"open_completed"`
+	OpenFailed        uint64               `json:"open_failed"`
+	OpenNanoseconds   uint64               `json:"open_nanoseconds"`
+	ReceivedResets    uint64               `json:"received_resets"`
+	SentResets        uint64               `json:"sent_resets"`
 }
 
 type AccountStatus struct {
-	Label                   string `json:"label"`
-	SenderConnected         bool   `json:"sender_connected"`
-	SenderConnectedSeconds  int64  `json:"sender_connected_seconds,omitempty"`
-	SenderConnectCount      uint64 `json:"sender_connect_count"`
-	SenderThrottledForMs    int64  `json:"sender_throttled_for_ms,omitempty"`
-	SentFrames              uint64 `json:"sent_frames"`
-	AppendBatches           uint64 `json:"append_batches"`
-	WatcherConnected        bool   `json:"watcher_connected"`
-	WatcherConnectedSeconds int64  `json:"watcher_connected_seconds,omitempty"`
-	WatcherConnectCount     uint64 `json:"watcher_connect_count"`
-	WatcherThrottledForMs   int64  `json:"watcher_throttled_for_ms,omitempty"`
-	ReceiveReady            bool   `json:"receive_ready"`
-	IdleSupported           *bool  `json:"idle_supported,omitempty"`
-	FramesReceived          uint64 `json:"frames_received"`
-	LastFrameAt             string `json:"last_frame_at,omitempty"`
-	LastFrameAgeMs          int64  `json:"last_frame_age_ms,omitempty"`
-	Proven                  bool   `json:"proven"`
+	SenderMetrics           imappkg.SenderMetrics  `json:"sender_metrics"`
+	WatcherMetrics          imappkg.WatcherMetrics `json:"watcher_metrics"`
+	Label                   string                 `json:"label"`
+	SenderConnected         bool                   `json:"sender_connected"`
+	SenderConnectedSeconds  int64                  `json:"sender_connected_seconds,omitempty"`
+	SenderConnectCount      uint64                 `json:"sender_connect_count"`
+	SenderThrottledForMs    int64                  `json:"sender_throttled_for_ms,omitempty"`
+	SentFrames              uint64                 `json:"sent_frames"`
+	AppendBatches           uint64                 `json:"append_batches"`
+	WatcherConnected        bool                   `json:"watcher_connected"`
+	WatcherConnectedSeconds int64                  `json:"watcher_connected_seconds,omitempty"`
+	WatcherConnectCount     uint64                 `json:"watcher_connect_count"`
+	WatcherThrottledForMs   int64                  `json:"watcher_throttled_for_ms,omitempty"`
+	ReceiveReady            bool                   `json:"receive_ready"`
+	IdleSupported           *bool                  `json:"idle_supported,omitempty"`
+	FramesReceived          uint64                 `json:"frames_received"`
+	LastFrameAt             string                 `json:"last_frame_at,omitempty"`
+	LastFrameAgeMs          int64                  `json:"last_frame_age_ms,omitempty"`
+	Proven                  bool                   `json:"proven"`
 }
 
 func (t *Tunnel) StatusSnapshot() StatusSnapshot {
@@ -51,6 +59,11 @@ func (t *Tunnel) StatusSnapshot() StatusSnapshot {
 		AccountsConnected: t.paths.ConnectedCount(),
 		AccountsProven:    t.paths.ProvenCount(),
 		ReorderGaps:       t.streams.ReorderGaps(time.Now()),
+		OpenCompleted:     t.openCompleted.Load(),
+		OpenFailed:        t.openFailed.Load(),
+		OpenNanoseconds:   t.openNanoseconds.Load(),
+		ReceivedResets:    t.receivedResets.Load(),
+		SentResets:        t.sentResets.Load(),
 	}
 	s.Accounts = t.paths.AccountStatuses()
 	return s
@@ -61,6 +74,7 @@ func (m *Multipath) AccountStatuses() []AccountStatus {
 	now := time.Now()
 	for i, sender := range m.senders {
 		status := AccountStatus{
+			SenderMetrics:      sender.Metrics(),
 			Label:              sender.Label(),
 			SenderConnected:    sender.Connected(),
 			SenderConnectCount: sender.ConnectCount(),
@@ -78,6 +92,7 @@ func (m *Multipath) AccountStatuses() []AccountStatus {
 		}
 		if i < len(m.watchers) {
 			watcher := m.watchers[i]
+			status.WatcherMetrics = watcher.Metrics()
 			status.WatcherConnected = watcher.Connected()
 			status.WatcherConnectCount = watcher.ConnectCount()
 			status.ReceiveReady = watcher.ReceiveReady()

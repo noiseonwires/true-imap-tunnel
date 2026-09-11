@@ -47,10 +47,12 @@ func EncodeBatch(frames []Frame) ([]byte, error) {
 	out := make([]byte, 0, size)
 	out = append(out, BatchMagic)
 	out = binary.BigEndian.AppendUint16(out, uint16(len(frames)))
-	for i := range frames {
-		enc := Encode(frames[i])
-		out = binary.BigEndian.AppendUint32(out, uint32(len(enc)))
-		out = append(out, enc...)
+	for _, frame := range frames {
+		out = binary.BigEndian.AppendUint32(out, uint32(HeaderSize+len(frame.Payload)))
+		out = append(out, frame.Type)
+		out = binary.BigEndian.AppendUint32(out, frame.StreamID)
+		out = binary.BigEndian.AppendUint32(out, frame.SeqID)
+		out = append(out, frame.Payload...)
 	}
 	return out, nil
 }

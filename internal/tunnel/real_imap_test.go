@@ -24,17 +24,19 @@ import (
 )
 
 type httpSmokeResult struct {
-	Provider             string  `json:"provider"`
-	SmallRequests        int     `json:"small_requests"`
-	ConcurrentRequests   int     `json:"concurrent_requests"`
-	LatencyP50Ms         float64 `json:"latency_p50_ms"`
-	LatencyP95Ms         float64 `json:"latency_p95_ms"`
-	LatencyMaxMs         float64 `json:"latency_max_ms"`
-	DownloadBytes        int64   `json:"download_bytes"`
-	DownloadSeconds      float64 `json:"download_seconds"`
-	DownloadMiBPerSecond float64 `json:"download_mib_per_second"`
-	SHA256               string  `json:"sha256"`
-	AsyncData            bool    `json:"async_data"`
+	Provider             string          `json:"provider"`
+	SmallRequests        int             `json:"small_requests"`
+	ConcurrentRequests   int             `json:"concurrent_requests"`
+	LatencyP50Ms         float64         `json:"latency_p50_ms"`
+	LatencyP95Ms         float64         `json:"latency_p95_ms"`
+	LatencyMaxMs         float64         `json:"latency_max_ms"`
+	DownloadBytes        int64           `json:"download_bytes"`
+	DownloadSeconds      float64         `json:"download_seconds"`
+	DownloadMiBPerSecond float64         `json:"download_mib_per_second"`
+	SHA256               string          `json:"sha256"`
+	AsyncData            bool            `json:"async_data"`
+	ClientAccounts       []AccountStatus `json:"client_accounts"`
+	ServerAccounts       []AccountStatus `json:"server_accounts"`
 }
 
 func TestRealIMAPHTTP(t *testing.T) {
@@ -208,6 +210,8 @@ func TestRealIMAPHTTP(t *testing.T) {
 	}
 	sort.Float64s(latencies)
 	result := httpSmokeResult{Provider: host, SmallRequests: len(latencies), ConcurrentRequests: 32, LatencyP50Ms: latencies[49], LatencyP95Ms: latencies[94], LatencyMaxMs: latencies[99], DownloadBytes: count, DownloadSeconds: elapsed.Seconds(), DownloadMiBPerSecond: float64(count) / (1024 * 1024) / elapsed.Seconds(), SHA256: hex.EncodeToString(hash.Sum(nil)), AsyncData: async}
+	result.ClientAccounts = client.paths.AccountStatuses()
+	result.ServerAccounts = server.paths.AccountStatuses()
 	encoded, _ := json.MarshalIndent(result, "", "  ")
 	t.Logf("HTTP smoke result:\n%s", encoded)
 	if path := os.Getenv("TIT_SMOKE_RESULT_OUT"); path != "" {
