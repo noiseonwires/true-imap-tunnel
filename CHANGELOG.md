@@ -1,28 +1,13 @@
 # Changelog
 
-## Unreleased
+## v0.5.0
 
-### Fixed
-
-- Duplicate OPEN retries preserve live sequencing, replay the original open response, and avoid duplicate target dials. Client stream IDs skip active and recently reserved IDs.
-- TCP half-close preserves the opposite direction; FIN waits for async DATA completion across paths before graceful stream cleanup.
-- IMAP connection setup, queue waits, retries, and pending target writes respond to cancellation. Receive-generated control replies no longer block mailbox dispatch.
-- Sender batching yields between queue snapshots and preserves deferred per-client ordering. Closed streams and completed work release retained state.
-- Lazy expunge honors the oldest pending deletion's age even without new mail, retains cleanup across same-UIDVALIDITY reconnects, and avoids payload replay after STORE/EXPUNGE failures.
-
-### Added
-
-- Read-only `reorder_gaps` status diagnostics: stream ID, missing sequence, pending frame/payload-byte counts, and age. Observation does not reset quiet streams.
-- Failure-path and burst regression tests, CI race detection, and an opt-in real-IMAP HTTP latency/download smoke test.
-- Aggregate sender queue/APPEND metrics, watcher activity metrics, OPEN duration and reset counters, and reproducible bulk/interactive/mixed-path benchmarks.
-
-### Performance
-
-- Successful APPEND batches wake only their paired watcher; async queue admission no longer triggers premature polling. Empty safety polls back off within existing polling settings.
-- New affinity routes and fallback candidates use receive readiness, recent path evidence, throttle state, and estimated queued work. Healthy affinity stays pinned; explicit frame-round-robin distribution is preserved. Startup-only ping mode now re-probes stale eligible paths every 60 seconds; negative ping intervals still disable probes.
-- PING/PONG/RST can precede queued bulk DATA between APPENDs without moving FIN ahead of its DATA. Batch encoding and normal base64 extraction each use one allocation, with no wire-format changes.
-
-Existing queue/batch settings, stream timeouts, and opt-in async/multipath defaults are unchanged. No new resource quotas or pressure-triggered resets were added.
+- Fixed duplicate connection opens, truncated half-closed streams, and shutdown hangs.
+- Improved mailbox cleanup, batching fairness, and control-message responsiveness.
+- Reduced polling and allocations; new streams prefer healthier, less-busy accounts.
+- Added transport diagnostics, benchmarks, and real-server HTTP regression tests.
+- Startup-only ping mode now checks stale paths for recovery every 60 seconds; negative intervals still disable probes.
+- Wire format, stream timeouts, and opt-in defaults are unchanged. No new resource limits.
 
 ## v0.4.2
 

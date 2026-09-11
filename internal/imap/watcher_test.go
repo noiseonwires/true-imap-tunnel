@@ -178,6 +178,12 @@ func TestLazyExpungeFailureRetainsPending(t *testing.T) {
 	if err := client.Login("test", "test").Wait(); err != nil {
 		t.Fatal(err)
 	}
+	if !client.Caps().Has(imap.CapUIDPlus) {
+		t.Fatal("test server did not advertise UIDPLUS")
+	}
+	if err := client.Noop().Wait(); err != nil {
+		t.Fatal(err)
+	}
 	watcher := NewWatcher(&config.Config{}, &config.AccountConfig{}, nil, nil)
 	watcher.client = client
 	watcher.addPendingExpunge(imap.UIDSetNum(9), 1)

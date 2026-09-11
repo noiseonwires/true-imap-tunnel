@@ -5,7 +5,7 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-val buildVersion = providers.gradleProperty("buildVersion").orElse("0.4.0").get()
+val buildVersion = providers.gradleProperty("buildVersion").orElse("0.5.0").get()
 
 android {
     namespace = "com.trueimaptunnel.plugin"
@@ -15,7 +15,7 @@ android {
         applicationId = "com.trueimaptunnel.plugin"
         minSdk = 23
         targetSdk = 35
-        versionCode = 4
+        versionCode = 5
         versionName = buildVersion
     }
 

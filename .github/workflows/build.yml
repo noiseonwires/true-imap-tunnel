@@ -206,6 +206,18 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+      - name: Extract release notes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          awk -v header="## $RELEASE_TAG" '
+            { sub(/\r$/, "") }
+            $0 == header { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          test -s RELEASE_NOTES.md
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -219,4 +231,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: release/*
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
